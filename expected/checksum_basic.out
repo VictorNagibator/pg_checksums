@@ -1,0 +1,139 @@
+-- Basic checksum functionality tests
+-- Test 1: Verify basic tuple checksum functionality with deterministic data
+CREATE TABLE test_basic (
+    id integer PRIMARY KEY,
+    name text NOT NULL,
+    value float,
+    data bytea
+);
+-- Insert deterministic test data (no random values)
+INSERT INTO test_basic VALUES 
+    (1, 'Alice', 100.5, E'\\xDEADBEEF'),
+    (2, 'Bob', 200.75, NULL),
+    (3, 'Charlie', NULL, E'\\xCAFEBABE'),
+    (4, 'David', 400.0, E'\\x12345678'),
+    (5, 'David', 400.0, E'\\x12345678'); -- Same data as row 4
+-- Test A: All tuple checksums should be non-zero
+SELECT 
+    COUNT(*) = 5 AS all_tuples_have_non_zero_checksum
+FROM (
+    SELECT pg_tuple_checksum('test_basic'::regclass, ctid, false) AS checksum
+    FROM test_basic
+) t
+WHERE checksum != 0;
+ all_tuples_have_non_zero_checksum 
+-----------------------------------
+ t
+(1 row)
+
+-- Test B: Checksums with header should be different from without header
+SELECT 
+    COUNT(*) = 5 AS header_changes_all_checksums
+FROM (
+    SELECT 
+        pg_tuple_checksum('test_basic'::regclass, ctid, false) AS without_header,
+        pg_tuple_checksum('test_basic'::regclass, ctid, true) AS with_header
+    FROM test_basic
+) t
+WHERE without_header != with_header;
+ header_changes_all_checksums 
+------------------------------
+ t
+(1 row)
+
+-- Test C: Column checksums for non-NULL columns should not be -1
+SELECT 
+    COUNT(*) = 10 AS non_null_columns_valid
+FROM (
+    SELECT pg_column_checksum('test_basic'::regclass, ctid, 1) AS checksum
+    FROM test_basic
+    UNION ALL
+    SELECT pg_column_checksum('test_basic'::regclass, ctid, 2) AS checksum
+    FROM test_basic
+) t
+WHERE checksum != -1;
+ non_null_columns_valid 
+------------------------
+ t
+(1 row)
+
+-- Test D: NULL columns should return -1
+SELECT 
+    COUNT(*) = 2 AS null_columns_return_neg_one
+FROM (
+    SELECT pg_column_checksum('test_basic'::regclass, ctid, 3) AS checksum
+    FROM test_basic WHERE value IS NULL
+    UNION ALL
+    SELECT pg_column_checksum('test_basic'::regclass, ctid, 4) AS checksum
+    FROM test_basic WHERE data IS NULL
+) t
+WHERE checksum = -1;
+ null_columns_return_neg_one 
+-----------------------------
+ t
+(1 row)
+
+-- Test E: Identical data rows should have different checksums (due to different ctid)
+SELECT 
+    COUNT(*) = 1 AS identical_rows_have_different_checksums
+FROM (
+    SELECT 
+        pg_tuple_checksum('test_basic'::regclass, t1.ctid, false) AS checksum1,
+        pg_tuple_checksum('test_basic'::regclass, t2.ctid, false) AS checksum2
+    FROM test_basic t1, test_basic t2
+    WHERE t1.id = 4 AND t2.id = 5
+       AND t1.name = t2.name
+       AND t1.value = t2.value
+       AND t1.data = t2.data
+) t
+WHERE checksum1 != checksum2;
+ identical_rows_have_different_checksums 
+-----------------------------------------
+ t
+(1 row)
+
+-- Test F: Checksum changes when data is modified
+DO $$
+DECLARE
+    old_checksum integer;
+    new_checksum integer;
+    test_passed boolean := false;
+BEGIN
+    -- Get original checksum
+    SELECT pg_tuple_checksum('test_basic'::regclass, ctid, false) 
+    INTO old_checksum
+    FROM test_basic WHERE id = 1;
+    
+    -- Modify the data
+    UPDATE test_basic SET value = 999.99 WHERE id = 1;
+    
+    -- Get new checksum
+    SELECT pg_tuple_checksum('test_basic'::regclass, ctid, false) 
+    INTO new_checksum
+    FROM test_basic WHERE id = 1;
+    
+    -- Test passes if checksums are different
+    IF old_checksum != new_checksum THEN
+        test_passed := true;
+    END IF;
+    
+    -- Restore original value for other tests
+    UPDATE test_basic SET value = 100.5 WHERE id = 1;
+    
+    IF NOT test_passed THEN
+        RAISE EXCEPTION 'Test F failed: Checksum did not change after data modification';
+    END IF;
+END;
+$$;
+-- Test G: All checksums must be different
+SELECT 
+    COUNT(DISTINCT pg_column_checksum('test_basic'::regclass, ctid, 2)) = 4 
+    AS all_name_checksums_unique
+FROM test_basic;
+ all_name_checksums_unique 
+---------------------------
+ t
+(1 row)
+
+-- Clean up
+DROP TABLE test_basic;

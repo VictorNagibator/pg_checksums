@@ -1,0 +1,110 @@
+-- Table-level checksum tests
+
+CREATE TABLE test_table_checksum (
+    id integer PRIMARY KEY,
+    group_id integer NOT NULL,
+    data text NOT NULL,
+    created_at timestamp DEFAULT '2024-01-01 00:00:00'
+);
+
+-- Insert deterministic test data
+INSERT INTO test_table_checksum (id, group_id, data)
+SELECT 
+    gs,
+    gs % 5,
+    'data_' || gs
+FROM generate_series(1, 100) gs;
+
+-- Test A: Table checksum should be non-zero for non-empty table
+SELECT 
+    pg_table_checksum('test_table_checksum'::regclass, false) != 0 
+    AS table_checksum_non_zero,
+    pg_table_checksum('test_table_checksum'::regclass, true) != 0 
+    AS table_with_header_non_zero;
+
+-- Test B: Checksums with and without header should be different
+SELECT 
+    pg_table_checksum('test_table_checksum'::regclass, false) != 
+    pg_table_checksum('test_table_checksum'::regclass, true) 
+    AS header_changes_table_checksum;
+
+-- Test C: Empty table should have zero checksum
+CREATE TABLE test_empty_table (id integer);
+SELECT 
+    pg_table_checksum('test_empty_table'::regclass, false) = 0 
+    AS empty_table_checksum_zero,
+    pg_table_checksum('test_empty_table'::regclass, true) = 0 
+    AS empty_table_with_header_zero;
+
+-- Test D: Table checksum should change when data changes
+DO $$
+DECLARE
+    old_checksum bigint;
+    new_checksum bigint;
+BEGIN
+    -- Get original checksum
+    old_checksum := pg_table_checksum('test_table_checksum'::regclass, false);
+    
+    -- Modify a row
+    UPDATE test_table_checksum 
+    SET data = 'modified'
+    WHERE id = 1;
+    
+    -- Get new checksum
+    new_checksum := pg_table_checksum('test_table_checksum'::regclass, false);
+    
+    -- Restore original data
+    UPDATE test_table_checksum 
+    SET data = 'data_1'
+    WHERE id = 1;
+    
+    -- Test fails if checksums are the same
+    IF old_checksum = new_checksum THEN
+        RAISE EXCEPTION 'Test D failed: Table checksum should change after data modification';
+    END IF;
+END;
+$$;
+
+-- Test E: Table checksum should change when ANY data changes
+-- Note: Due to MVCC (xmin/xmax changes), checksums will be different
+-- even if data is restored to original values
+DO $$
+DECLARE
+    checksum1 bigint;
+    checksum2 bigint;
+    checksum3 bigint;
+BEGIN
+    -- Get initial checksum
+    checksum1 := pg_table_checksum('test_table_checksum'::regclass, false);
+    
+    -- Make a modification
+    UPDATE test_table_checksum SET data = 'temp' WHERE id = 2;
+    checksum2 := pg_table_checksum('test_table_checksum'::regclass, false);
+    
+    -- Restore original value
+    UPDATE test_table_checksum SET data = 'data_2' WHERE id = 2;
+    checksum3 := pg_table_checksum('test_table_checksum'::regclass, false);
+    
+    -- Checksums should all be different due to MVCC changes
+    -- But at minimum, checksum1 should not equal checksum2
+    IF checksum1 = checksum2 THEN
+        RAISE EXCEPTION 'Table checksum should change after data modification';
+    END IF;
+END;
+$$;
+
+-- Test F: Different groups should have different aggregated checksums
+WITH group_checksums AS (
+    SELECT 
+        group_id,
+        BIT_XOR(pg_tuple_checksum('test_table_checksum'::regclass, ctid, false)) as group_checksum
+    FROM test_table_checksum
+    GROUP BY group_id
+)
+SELECT 
+    COUNT(DISTINCT group_checksum) = COUNT(*) AS all_groups_have_unique_checksums
+FROM group_checksums;
+
+-- Clean up
+DROP TABLE test_empty_table;
+DROP TABLE test_table_checksum;

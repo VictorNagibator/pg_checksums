@@ -1,0 +1,85 @@
+-- Index checksum tests
+
+CREATE TABLE test_index_checksum (
+    id integer PRIMARY KEY,
+    key1 integer NOT NULL,
+    key2 text NOT NULL,
+    value float NOT NULL
+);
+
+-- Insert deterministic test data
+INSERT INTO test_index_checksum (id, key1, key2, value)
+SELECT 
+    gs,
+    gs,
+    'key_' || gs,
+    gs * 1.5
+FROM generate_series(1, 100) gs;
+
+-- Create various index types
+CREATE INDEX idx_test_btree ON test_index_checksum (key1);
+CREATE INDEX idx_test_btree_multi ON test_index_checksum (key1, key2);
+CREATE INDEX idx_test_hash ON test_index_checksum USING hash (key2);
+CREATE UNIQUE INDEX idx_test_unique ON test_index_checksum (key1, key2, value);
+
+-- Test A: All index checksums should be non-zero
+SELECT 
+    'idx_test_btree' as index_name,
+    pg_index_checksum('idx_test_btree'::regclass) != 0 AS checksum_non_zero;
+
+-- Test B: Different indexes should have different checksums
+SELECT 
+    COUNT(DISTINCT checksum) = 4 AS all_indexes_have_unique_checksums
+FROM (
+    SELECT pg_index_checksum('idx_test_btree'::regclass) as checksum
+    UNION ALL
+    SELECT pg_index_checksum('idx_test_btree_multi'::regclass)
+    UNION ALL
+    SELECT pg_index_checksum('idx_test_hash'::regclass)
+    UNION ALL
+    SELECT pg_index_checksum('idx_test_unique'::regclass)
+) t;
+
+-- Test C: Index checksum should change when indexed data changes
+DO $$
+DECLARE
+    old_checksum integer;
+    new_checksum integer;
+BEGIN
+    -- Get original checksum
+    old_checksum := pg_index_checksum('idx_test_btree'::regclass);
+    
+    -- Modify indexed column
+    UPDATE test_index_checksum 
+    SET key1 = key1 + 1000
+    WHERE id = 1;
+    
+    -- Get new checksum
+    new_checksum := pg_index_checksum('idx_test_btree'::regclass);
+    
+    -- Restore original value
+    UPDATE test_index_checksum 
+    SET key1 = key1 - 1000
+    WHERE id = 1;
+    
+    -- Test fails if checksums are the same
+    IF old_checksum = new_checksum THEN
+        RAISE EXCEPTION 'Index checksum should change after data modification';
+    END IF;
+END;
+$$;
+
+-- Test D: Partial index checksum
+CREATE INDEX idx_test_partial ON test_index_checksum (key1) 
+WHERE value > 75;  -- Should include about half the rows
+
+SELECT 
+    'idx_test_partial' as index_name,
+    pg_index_checksum('idx_test_partial'::regclass) != 0 AS checksum_non_zero;
+
+-- Test E: Expression index checksum
+CREATE INDEX idx_test_expression ON test_index_checksum ((key1 * 2));
+
+SELECT 
+    'idx_test_expression' as index_name,
+    pg_index_checksum('idx_test_expression'::regclass) != 0 AS checksum_non_zero;

@@ -1,0 +1,7 @@
+# contrib/pg_checksums/pg_checksums.control
+
+comment = 'Checksum functions for PostgreSQL at tuple, column, table, index and database levels'
+default_version = '1.0'
+module_pathname = '$libdir/pg_checksums'
+relocatable = true
+superuser = false
