@@ -267,6 +267,8 @@ EXECUTE FUNCTION audit_table_changes();
 
 ## Test Suite
 
+The `pg_checksums` extension includes a comprehensive test suite that validates functionality at all granularity levels and ensures algorithm correctness. The tests are divided into two categories: **regression tests** (SQL-based) and **TAP tests** (Perl-based).
+
 ```bash
 # Run regression (and TAP if enabled) tests
 make USE_PGXS=1 installcheck
