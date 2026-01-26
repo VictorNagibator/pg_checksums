@@ -1,4 +1,4 @@
-# contrib/pg_checksums/Makefile
+# Makefile
 
 MODULE_big = pg_checksums
 OBJS = pg_checksums.o

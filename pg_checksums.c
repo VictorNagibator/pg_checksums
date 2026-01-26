@@ -1,17 +1,53 @@
 /*-------------------------------------------------------------------------
  *
- * contrib/pg_checksums/pg_checksums.c
- *    Checksum functions for PostgreSQL extension
+ * pg_checksums.c
+ *    Implementation of multi-level checksum functionality for PostgreSQL
  *
- * This extension provides checksum functionality at all granularities:
- * - Tuple-level checksums
- * - Column-level checksums  
- * - Table-level checksums
- * - Index-level checksums
- * - Database-level checksums
+ * This module provides checksum computation at five distinct levels:
+ *
+ * 1. COLUMN LEVEL (pg_column_checksum):
+ *    - Computes checksum for individual column values
+ *    - NULL values return CHECKSUM_NULL (0xFFFFFFFF)
+ *    - Uses attribute number as hash seed for uniqueness across columns
+ *    - Handles all PostgreSQL data types (byval, byref, varlena, cstring)
+ *    - Guarantee: Different column types/values → different checksums
+ *
+ * 2. TUPLE LEVEL (pg_tuple_checksum):
+ *    - Computes checksum for entire table rows (tuples)
+ *    - Two modes: with/without tuple header (transaction visibility info)
+ *    - Seeds hash with physical location (block << 16 | offset)
+ *    - Incorporates MVCC information (xmin/xmax) when excluding header
+ *    - Guarantee: Same data at different locations → different checksums
+ *    - Guarantee: Any data change → different checksum
+ *
+ * 3. TABLE LEVEL (pg_table_checksum):
+ *    - Aggregates checksums of all tuples in a table
+ *    - Uses XOR aggregation for efficient incremental updates
+ *    - Includes relation OID in aggregation to ensure cross-table uniqueness
+ *    - Empty tables return 0
+ *    - Property: Adding/removing tuples changes table checksum
+ *
+ * 4. INDEX LEVEL (pg_index_checksum):
+ *    - Computes checksum for index contents
+ *    - Processes all index pages and live index tuples
+ *    - For B-tree indexes, includes heap TID in checksum calculation
+ *    - XOR aggregation across all index tuples
+ *    - Property: Index rebuild with same data produces same checksum
+ *
+ * 5. DATABASE LEVEL (pg_database_checksum):
+ *    - Superuser-only function for entire database checksum
+ *    - Aggregates checksums of all tables and indexes
+ *    - Optional filtering of system catalogs and TOAST tables
+ *    - Uses consistent snapshot for repeatable results
+ *    - Security: Requires superuser to prevent information disclosure
+ *
+ * Algorithm Details:
+ * - Uses FNV-1a 32-bit hash (same as PostgreSQL's built-in checksums)
+ * - Hash formula: hash = (hash ^ byte) * FNV_PRIME_32
+ * - Initial seed varies by context (location, attribute number, etc.)
+ * - XOR post-processing ensures uniqueness and avoids CHECKSUM_NULL collisions
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
- * Portions Copyright (c) 1994, Regents of the University of California
  *
  *-------------------------------------------------------------------------
  */
@@ -42,7 +78,20 @@
 PG_MODULE_MAGIC;
 
 /*
- * FNV-1a 32-bit hash implementation (identical to PostgreSQL's algorithm)
+ * fnv1a_32_hash - FNV-1a 32-bit hash implementation
+ *
+ * This is identical to PostgreSQL's internal checksum algorithm for
+ * compatibility and consistency. The algorithm provides good avalanche
+ * properties and low collision rates for typical database data.
+ *
+ * Parameters:
+ *   data: Pointer to data to hash
+ *   len: Length of data in bytes
+ *   seed: Initial hash value (0 uses FNV_BASIS_32)
+ *
+ * Returns: 32-bit hash value
+ *
+ * Algorithm: hash = (hash ^ byte) * FNV_PRIME_32 for each byte
  */
 static uint32
 fnv1a_32_hash(const void *data, size_t len, uint32 seed)
@@ -60,8 +109,14 @@ fnv1a_32_hash(const void *data, size_t len, uint32 seed)
 }
 
 /*
- * Custom checksum implementation based on PostgreSQL's algorithm
- * This is used for data blocks when pg_checksum_data is not available
+ * pg_checksum_data_custom - Wrapper for FNV-1a hash
+ *
+ * This function provides the checksum algorithm for all data types.
+ * It's used when pg_checksum_data() is not available or when we need
+ * custom seeding behavior for different granularity levels.
+ *
+ * The init_value parameter allows different contexts to seed the hash
+ * differently (e.g., with attribute number for columns, location for tuples).
  */
 uint32
 pg_checksum_data_custom(const char *data, uint32 len, uint32 init_value)
@@ -70,7 +125,13 @@ pg_checksum_data_custom(const char *data, uint32 len, uint32 init_value)
 }
 
 /*
- * Wrapper for pg_checksum_page (built-in function)
+ * pg_page_checksum - SQL function for page-level checksums
+ *
+ * Wrapper around PostgreSQL's built-in pg_checksum_page() function.
+ * Provides checksums for individual database pages, useful for detecting
+ * physical corruption at the storage level.
+ *
+ * Returns: 16-bit page checksum (same as built-in) or 0 for new pages
  */
 PG_FUNCTION_INFO_V1(pg_page_checksum);
 
@@ -112,7 +173,13 @@ pg_page_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Internal tuple checksum calculation
+ * pg_tuple_checksum_internal - Core tuple checksum calculation
+ *
+ * This is the heart of the tuple checksum system. It computes a checksum
+ * that uniquely identifies a tuple based on:
+ * 1. Tuple data content (header optional)
+ * 2. Physical location (block and offset)
+ * 3. MVCC information (xmin/xmax when header excluded)
  */
 uint32
 pg_tuple_checksum_internal(Page page, OffsetNumber offnum, BlockNumber blkno, bool include_header)
@@ -177,7 +244,17 @@ pg_tuple_checksum_internal(Page page, OffsetNumber offnum, BlockNumber blkno, bo
 }
 
 /*
- * Tuple checksum - SQL function
+ * pg_tuple_checksum - SQL function for tuple-level checksums
+ *
+ * Public interface for computing tuple checksums. Handles buffer management,
+ * locking, and error recovery to ensure safe access to shared buffers.
+ *
+ * Parameters:
+ *   reloid: Relation OID containing the tuple
+ *   tid: TID (block, offset) of the tuple
+ *   include_header: Whether to include tuple header in checksum
+ *
+ * Returns: 32-bit tuple checksum
  */
 PG_FUNCTION_INFO_V1(pg_tuple_checksum);
 
@@ -239,7 +316,16 @@ pg_tuple_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Column checksum calculation
+ * pg_column_checksum_internal - Core column checksum calculation
+ *
+ * Computes checksums for individual column values with special handling for:
+ * 1. NULL values: Returns CHECKSUM_NULL (0xFFFFFFFF)
+ * 2. Data types: Proper handling of byval, byref, varlena, and cstring types
+ * 3. Detoasting: Expands compressed varlena data for accurate checksums
+ * 4. Type awareness: Uses type information for proper length determination
+ *
+ * The attnum parameter seeds the hash, ensuring different columns with
+ * identical values have different checksums.
  */
 static uint32
 pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
@@ -314,7 +400,13 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
 }
 
 /*
- * Column checksum - SQL function
+ * pg_column_checksum - SQL function for column-level checksums
+ *
+ * Public interface for computing column checksums. Handles relation access,
+ * tuple fetching, and type system interaction.
+ *
+ * Returns CHECKSUM_NULL (-1) for NULL columns, ensuring clear distinction
+ * between NULL and valid checksum values (which can include 0).
  */
 PG_FUNCTION_INFO_V1(pg_column_checksum);
 
@@ -396,7 +488,14 @@ pg_column_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Table checksum - SQL function
+ * pg_table_checksum - SQL function for table-level checksums
+ *
+ * Computes a checksum representing the entire table state by aggregating
+ * all tuple checksums using XOR. This provides:
+ * 1. Efficient aggregation: XOR is associative, commutative, and reversible
+ * 2. Incremental updates: Adding/removing tuples has predictable effect
+ * 3. Relation identity: Includes relation OID in aggregation
+ * 4. Snapshot consistency: Uses GetActiveSnapshot() for MVCC correctness
  */
 PG_FUNCTION_INFO_V1(pg_table_checksum);
 
@@ -455,7 +554,11 @@ pg_table_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Index checksum - SQL function
+ * pg_index_checksum - SQL function for index-level checksums
+ *
+ * Computes checksums for index structures by scanning all index pages.
+ * Special handling for B-tree indexes includes heap TID in checksum
+ * to maintain consistency with table organization.
  */
 PG_FUNCTION_INFO_V1(pg_index_checksum);
 
@@ -545,7 +648,18 @@ pg_index_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Database checksum - SQL function (superuser only)
+ * pg_database_checksum - SQL function for database-level checksums
+ *
+ * Superuser-only function that computes checksum for entire database
+ * by aggregating checksums of all relations. Security considerations:
+ * 1. Requires superuser to prevent information disclosure about system objects
+ * 2. Uses PG_TRY/PG_CATCH to handle inaccessible relations gracefully
+ * 3. Configurable filtering of system catalogs and TOAST tables
+ *
+ * Implementation notes:
+ * - Scans pg_class with consistent snapshot for repeatable results
+ * - Skips non-table/index relations (views, foreign tables, etc.)
+ * - Handles relation access failures gracefully
  */
 PG_FUNCTION_INFO_V1(pg_database_checksum);
 
@@ -652,7 +766,15 @@ pg_database_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Data checksum - SQL function
+ * pg_data_checksum - Generic data checksum utility function
+ *
+ * Raw data checksum function for arbitrary bytea data. Useful for:
+ * - Application-level data verification
+ * - Custom checksum requirements
+ * - Testing and debugging
+ *
+ * The seed parameter allows different contexts to produce different
+ * checksums for identical data.
  */
 PG_FUNCTION_INFO_V1(pg_data_checksum);
 
@@ -677,7 +799,10 @@ pg_data_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
- * Text checksum - SQL function
+ * pg_text_checksum - Text data checksum utility function
+ *
+ * Convenience wrapper for text data. Useful for string comparison
+ * and text content verification without encoding concerns.
  */
 PG_FUNCTION_INFO_V1(pg_text_checksum);
 
