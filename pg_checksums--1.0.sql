@@ -9,7 +9,6 @@
  * Function Categories:
  * 1. Core checksum functions: Compute checksums at various levels
  * 2. Utility functions: Generic checksums for arbitrary data
- * 3. Helper views: Convenient views for monitoring and verification
  *
  * Usage Examples:
  * -- Column-level integrity check
