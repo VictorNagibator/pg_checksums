@@ -28,6 +28,9 @@
 
 ```bash
 # Clone or extract the extension
+git clone https://github.com/VictorNagibator/pg_checksums
+
+# Go into extension directory
 cd pg_checksums
 
 # Build
@@ -44,10 +47,10 @@ psql -d your_database -c "CREATE EXTENSION pg_checksums;"
 
 ## Usage Examples
 
-### Column-Level Integrity Check
+### Column-Level (Cell-level) Integrity Check
 
 ```sql
--- Get checksum for a specific column value
+-- Get checksum for a specific column value in a specific row
 SELECT pg_column_checksum('employees'::regclass, ctid, 3) 
 FROM employees WHERE employee_id = 123;
 
@@ -55,6 +58,8 @@ FROM employees WHERE employee_id = 123;
 SELECT pg_column_checksum('table'::regclass, ctid, 2) = -1 
 FROM table WHERE column IS NULL;
 ```
+
+**Note:** Column checksums are computed for individual values within specific rows, not for entire columns. To compute checksums for all values in a column, you would need to aggregate individual checksums.
 
 ### Tuple-Level Change Detection
 
@@ -88,6 +93,8 @@ SELECT pg_database_checksum(false, false);
 -- Include system tables and TOAST tables
 SELECT pg_database_checksum(true, true);
 ```
+
+**Note about shared system tables:** The `pg_database_checksum` function only includes tables from the current database. Cluster-wide shared system tables (e.g., `pg_authid`, `pg_database`) are not included in the checksum calculation as they belong to the entire PostgreSQL cluster, not to individual databases.
 
 ### Index Consistency Check
 
@@ -257,7 +264,7 @@ EXECUTE FUNCTION audit_table_changes();
 
 ### Lightweight Operations
 
-* **Column Checksums:** O(1) per column, minimal overhead
+* **Column Checksums:** O(1) per column value, minimal overhead for individual value computation
 * **Tuple Checksums:** O(tuple size), requires buffer locking
 * **Table Checksums:** O(N) full table scan, efficient with XOR aggregation
 * **Index Checksums:** O(index size), uses bulk read strategy
