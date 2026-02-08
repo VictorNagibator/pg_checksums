@@ -1,4 +1,4 @@
--- Table-level checksum tests
+-- Table-level checksum tests (physical and logical)
 
 CREATE TABLE test_table_checksum (
     id integer PRIMARY KEY,
@@ -15,43 +15,69 @@ SELECT
     'data_' || gs
 FROM generate_series(1, 100) gs;
 
--- Test A: Table checksum should be non-zero for non-empty table
+-- Test A: Table physical checksum should be non-zero for non-empty table
 SELECT 
-    pg_table_checksum('test_table_checksum'::regclass, false) != 0 
-    AS table_checksum_non_zero,
-    pg_table_checksum('test_table_checksum'::regclass, true) != 0 
-    AS table_with_header_non_zero;
+    pg_table_physical_checksum('test_table_checksum'::regclass, false) != 0 
+    AS table_physical_checksum_non_zero,
+    pg_table_physical_checksum('test_table_checksum'::regclass, true) != 0 
+    AS table_physical_with_header_non_zero;
 
--- Test B: Checksums with and without header should be different
+-- Test B: Table logical checksum should be non-zero (table has PK)
 SELECT 
-    pg_table_checksum('test_table_checksum'::regclass, false) != 
-    pg_table_checksum('test_table_checksum'::regclass, true) 
-    AS header_changes_table_checksum;
+    pg_table_logical_checksum('test_table_checksum'::regclass) IS NOT NULL AND
+    pg_table_logical_checksum('test_table_checksum'::regclass) != 0 
+    AS table_logical_checksum_non_zero;
 
--- Test C: Empty table should have zero checksum
+-- Test C: Physical checksums with and without header should be different
+SELECT 
+    pg_table_physical_checksum('test_table_checksum'::regclass, false) != 
+    pg_table_physical_checksum('test_table_checksum'::regclass, true) 
+    AS header_changes_table_physical_checksum;
+
+-- Test D: Empty table physical checksum should be non-zero (based on OID)
 CREATE TABLE test_empty_table (id integer);
 SELECT 
-    pg_table_checksum('test_empty_table'::regclass, false) = 0 
-    AS empty_table_checksum_zero,
-    pg_table_checksum('test_empty_table'::regclass, true) = 0 
-    AS empty_table_with_header_zero;
+    pg_table_physical_checksum('test_empty_table'::regclass, false) != 0 
+    AS empty_table_physical_checksum_non_zero,
+    pg_table_physical_checksum('test_empty_table'::regclass, true) != 0 
+    AS empty_table_physical_with_header_non_zero;
 
--- Test D: Table checksum should change when data changes
+-- Test E: Empty table logical checksum should be NULL (no PK)
+SELECT 
+    pg_table_logical_checksum('test_empty_table'::regclass) IS NULL
+    AS empty_table_logical_checksum_null;
+
+-- Test F: Table without PK should return NULL for logical checksum
+CREATE TABLE test_table_no_pk (
+    id integer,
+    data text
+);
+
+INSERT INTO test_table_no_pk (id, data)
+SELECT gs, 'no_pk_' || gs FROM generate_series(1, 10) gs;
+
+SELECT 
+    pg_table_logical_checksum('test_table_no_pk'::regclass) IS NULL
+    AS table_without_pk_logical_checksum_null;
+
+DROP TABLE test_table_no_pk;
+
+-- Test G: Physical checksum should change when data changes
 DO $$
 DECLARE
-    old_checksum bigint;
-    new_checksum bigint;
+    old_physical_checksum bigint;
+    new_physical_checksum bigint;
 BEGIN
-    -- Get original checksum
-    old_checksum := pg_table_checksum('test_table_checksum'::regclass, false);
+    -- Get original physical checksum
+    old_physical_checksum := pg_table_physical_checksum('test_table_checksum'::regclass, false);
     
     -- Modify a row
     UPDATE test_table_checksum 
     SET data = 'modified'
     WHERE id = 1;
     
-    -- Get new checksum
-    new_checksum := pg_table_checksum('test_table_checksum'::regclass, false);
+    -- Get new physical checksum
+    new_physical_checksum := pg_table_physical_checksum('test_table_checksum'::regclass, false);
     
     -- Restore original data
     UPDATE test_table_checksum 
@@ -59,51 +85,177 @@ BEGIN
     WHERE id = 1;
     
     -- Test fails if checksums are the same
-    IF old_checksum = new_checksum THEN
-        RAISE EXCEPTION 'Test D failed: Table checksum should change after data modification';
+    IF old_physical_checksum = new_physical_checksum THEN
+        RAISE EXCEPTION 'Test G failed: Table physical checksum should change after data modification';
     END IF;
 END;
 $$;
 
--- Test E: Table checksum should change when ANY data changes
--- Note: Due to MVCC (xmin/xmax changes), checksums will be different
--- even if data is restored to original values
+-- Test H: Logical checksum should change when data changes
 DO $$
 DECLARE
-    checksum1 bigint;
-    checksum2 bigint;
-    checksum3 bigint;
+    old_logical_checksum bigint;
+    new_logical_checksum bigint;
 BEGIN
-    -- Get initial checksum
-    checksum1 := pg_table_checksum('test_table_checksum'::regclass, false);
+    -- Get original logical checksum
+    old_logical_checksum := pg_table_logical_checksum('test_table_checksum'::regclass);
     
-    -- Make a modification
-    UPDATE test_table_checksum SET data = 'temp' WHERE id = 2;
-    checksum2 := pg_table_checksum('test_table_checksum'::regclass, false);
+    -- Modify a row
+    UPDATE test_table_checksum 
+    SET data = 'modified'
+    WHERE id = 2;
     
-    -- Restore original value
-    UPDATE test_table_checksum SET data = 'data_2' WHERE id = 2;
-    checksum3 := pg_table_checksum('test_table_checksum'::regclass, false);
+    -- Get new logical checksum
+    new_logical_checksum := pg_table_logical_checksum('test_table_checksum'::regclass);
     
-    -- Checksums should all be different due to MVCC changes
-    -- But at minimum, checksum1 should not equal checksum2
-    IF checksum1 = checksum2 THEN
-        RAISE EXCEPTION 'Table checksum should change after data modification';
+    -- Restore original data
+    UPDATE test_table_checksum 
+    SET data = 'data_2'
+    WHERE id = 2;
+    
+    -- Test fails if checksums are the same
+    IF old_logical_checksum = new_logical_checksum THEN
+        RAISE EXCEPTION 'Test H failed: Table logical checksum should change after data modification';
     END IF;
 END;
 $$;
 
--- Test F: Different groups should have different aggregated checksums
+-- Test I: Different groups should have different aggregated physical checksums
 WITH group_checksums AS (
     SELECT 
         group_id,
-        BIT_XOR(pg_tuple_checksum('test_table_checksum'::regclass, ctid, false)) as group_checksum
+        BIT_XOR(pg_tuple_physical_checksum('test_table_checksum'::regclass, ctid, false)) as group_checksum
     FROM test_table_checksum
     GROUP BY group_id
 )
 SELECT 
-    COUNT(DISTINCT group_checksum) = COUNT(*) AS all_groups_have_unique_checksums
+    COUNT(DISTINCT group_checksum) = COUNT(*) AS all_groups_have_unique_physical_checksums
 FROM group_checksums;
+
+-- Test J: Physical and logical checksums should be different
+SELECT 
+    pg_table_physical_checksum('test_table_checksum'::regclass, false) != 
+    pg_table_logical_checksum('test_table_checksum'::regclass)
+    AS physical_and_logical_checksums_are_different;
+
+-- Test K: Checksum consistency - same checksum for same data state
+DO $$
+DECLARE
+    physical_checksum1 bigint;
+    physical_checksum2 bigint;
+    logical_checksum1 bigint;
+    logical_checksum2 bigint;
+BEGIN
+    -- Get checksums twice in the same state
+    physical_checksum1 := pg_table_physical_checksum('test_table_checksum'::regclass, false);
+    physical_checksum2 := pg_table_physical_checksum('test_table_checksum'::regclass, false);
+    
+    logical_checksum1 := pg_table_logical_checksum('test_table_checksum'::regclass);
+    logical_checksum2 := pg_table_logical_checksum('test_table_checksum'::regclass);
+    
+    -- Physical checksums should be equal
+    IF physical_checksum1 != physical_checksum2 THEN
+        RAISE EXCEPTION 'Test K failed: Table physical checksum should be consistent for same data state';
+    END IF;
+    
+    -- Logical checksums should be equal
+    IF logical_checksum1 != logical_checksum2 THEN
+        RAISE EXCEPTION 'Test K failed: Table logical checksum should be consistent for same data state';
+    END IF;
+END;
+$$;
+
+-- Test L: Modify non-PK column and verify checksums change
+DO $$
+DECLARE
+    old_physical_checksum bigint;
+    new_physical_checksum bigint;
+    old_logical_checksum bigint;
+    new_logical_checksum bigint;
+BEGIN
+    -- Get original checksums
+    old_physical_checksum := pg_table_physical_checksum('test_table_checksum'::regclass, false);
+    old_logical_checksum := pg_table_logical_checksum('test_table_checksum'::regclass);
+    
+    -- Modify non-PK column (group_id)
+    UPDATE test_table_checksum 
+    SET group_id = group_id + 10
+    WHERE id = 3;
+    
+    -- Get new checksums
+    new_physical_checksum := pg_table_physical_checksum('test_table_checksum'::regclass, false);
+    new_logical_checksum := pg_table_logical_checksum('test_table_checksum'::regclass);
+    
+    -- Restore original value
+    UPDATE test_table_checksum 
+    SET group_id = group_id - 10
+    WHERE id = 3;
+    
+    -- Both checksums should change
+    IF old_physical_checksum = new_physical_checksum THEN
+        RAISE EXCEPTION 'Test L failed: Physical checksum should change after non-PK column modification';
+    END IF;
+    
+    IF old_logical_checksum = new_logical_checksum THEN
+        RAISE EXCEPTION 'Test L failed: Logical checksum should change after non-PK column modification';
+    END IF;
+END;
+$$;
+
+-- Test M: Add new row and verify checksums change
+DO $$
+DECLARE
+    old_physical_checksum bigint;
+    new_physical_checksum bigint;
+    old_logical_checksum bigint;
+    new_logical_checksum bigint;
+BEGIN
+    -- Get original checksums
+    old_physical_checksum := pg_table_physical_checksum('test_table_checksum'::regclass, false);
+    old_logical_checksum := pg_table_logical_checksum('test_table_checksum'::regclass);
+    
+    -- Add new row
+    INSERT INTO test_table_checksum (id, group_id, data)
+    VALUES (101, 0, 'new_data');
+    
+    -- Get new checksums
+    new_physical_checksum := pg_table_physical_checksum('test_table_checksum'::regclass, false);
+    new_logical_checksum := pg_table_logical_checksum('test_table_checksum'::regclass);
+    
+    -- Remove added row
+    DELETE FROM test_table_checksum WHERE id = 101;
+    
+    -- Both checksums should change
+    IF old_physical_checksum = new_physical_checksum THEN
+        RAISE EXCEPTION 'Test M failed: Physical checksum should change after adding new row';
+    END IF;
+    
+    IF old_logical_checksum = new_logical_checksum THEN
+        RAISE EXCEPTION 'Test M failed: Logical checksum should change after adding new row';
+    END IF;
+END;
+$$;
+
+-- Test N: Different tables should have different checksums
+CREATE TABLE test_table2 (
+    id integer PRIMARY KEY,
+    value integer NOT NULL
+);
+
+INSERT INTO test_table2 (id, value)
+SELECT gs, gs * 2 FROM generate_series(1, 50) gs;
+
+SELECT 
+    pg_table_physical_checksum('test_table_checksum'::regclass, false) != 
+    pg_table_physical_checksum('test_table2'::regclass, false)
+    AS different_tables_have_different_physical_checksums;
+
+SELECT 
+    pg_table_logical_checksum('test_table_checksum'::regclass) != 
+    pg_table_logical_checksum('test_table2'::regclass)
+    AS different_tables_have_different_logical_checksums;
+
+DROP TABLE test_table2;
 
 -- Clean up
 DROP TABLE test_empty_table;

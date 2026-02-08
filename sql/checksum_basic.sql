@@ -16,27 +16,49 @@ INSERT INTO test_basic VALUES
     (4, 'David', 400.0, E'\\x12345678'),
     (5, 'David', 400.0, E'\\x12345678'); -- Same data as row 4
 
--- Test A: All tuple checksums should be non-zero
+-- Test A: All physical tuple checksums should be non-zero
 SELECT 
-    COUNT(*) = 5 AS all_tuples_have_non_zero_checksum
+    COUNT(*) = 5 AS all_tuples_have_non_zero_physical_checksum
 FROM (
-    SELECT pg_tuple_checksum('test_basic'::regclass, ctid, false) AS checksum
+    SELECT pg_tuple_physical_checksum('test_basic'::regclass, ctid, false) AS checksum
     FROM test_basic
 ) t
 WHERE checksum != 0;
 
--- Test B: Checksums with header should be different from without header
+-- Test B: Physical checksums with header should be different from without header
 SELECT 
-    COUNT(*) = 5 AS header_changes_all_checksums
+    COUNT(*) = 5 AS header_changes_all_physical_checksums
 FROM (
     SELECT 
-        pg_tuple_checksum('test_basic'::regclass, ctid, false) AS without_header,
-        pg_tuple_checksum('test_basic'::regclass, ctid, true) AS with_header
+        pg_tuple_physical_checksum('test_basic'::regclass, ctid, false) AS without_header,
+        pg_tuple_physical_checksum('test_basic'::regclass, ctid, true) AS with_header
     FROM test_basic
 ) t
 WHERE without_header != with_header;
 
--- Test C: Column checksums for non-NULL columns should not be -1
+-- Test C: Logical tuple checksums should be non-zero (uses primary key)
+SELECT 
+    COUNT(*) = 5 AS all_tuples_have_non_zero_logical_checksum
+FROM (
+    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) AS checksum
+    FROM test_basic
+) t
+WHERE checksum IS NOT NULL AND checksum != 0;
+
+-- Test D: Logical checksums with header should be different from without header
+SELECT 
+    COUNT(*) = 5 AS header_changes_all_logical_checksums
+FROM (
+    SELECT 
+        pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) AS without_header,
+        pg_tuple_logical_checksum('test_basic'::regclass, ctid, true) AS with_header
+    FROM test_basic
+    WHERE pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) IS NOT NULL
+      AND pg_tuple_logical_checksum('test_basic'::regclass, ctid, true) IS NOT NULL
+) t
+WHERE without_header != with_header;
+
+-- Test E: Column checksums for non-NULL columns should not be -1
 SELECT 
     COUNT(*) = 10 AS non_null_columns_valid
 FROM (
@@ -48,7 +70,7 @@ FROM (
 ) t
 WHERE checksum != -1;
 
--- Test D: NULL columns should return -1
+-- Test F: NULL columns should return -1
 SELECT 
     COUNT(*) = 2 AS null_columns_return_neg_one
 FROM (
@@ -60,13 +82,13 @@ FROM (
 ) t
 WHERE checksum = -1;
 
--- Test E: Identical data rows should have different checksums (due to different ctid)
+-- Test G: Physical checksums for identical data rows should be different (due to different ctid)
 SELECT 
-    COUNT(*) = 1 AS identical_rows_have_different_checksums
+    COUNT(*) = 1 AS identical_rows_have_different_physical_checksums
 FROM (
     SELECT 
-        pg_tuple_checksum('test_basic'::regclass, t1.ctid, false) AS checksum1,
-        pg_tuple_checksum('test_basic'::regclass, t2.ctid, false) AS checksum2
+        pg_tuple_physical_checksum('test_basic'::regclass, t1.ctid, false) AS checksum1,
+        pg_tuple_physical_checksum('test_basic'::regclass, t2.ctid, false) AS checksum2
     FROM test_basic t1, test_basic t2
     WHERE t1.id = 4 AND t2.id = 5
        AND t1.name = t2.name
@@ -75,28 +97,45 @@ FROM (
 ) t
 WHERE checksum1 != checksum2;
 
--- Test F: Checksum changes when data is modified
+-- Test H: Logical checksums for rows with different primary keys should be different
+SELECT 
+    COUNT(*) = 1 AS different_pk_rows_have_different_logical_checksums
+FROM (
+    SELECT 
+        pg_tuple_logical_checksum('test_basic'::regclass, t1.ctid, false) AS checksum1,
+        pg_tuple_logical_checksum('test_basic'::regclass, t2.ctid, false) AS checksum2
+    FROM test_basic t1, test_basic t2
+    WHERE t1.id = 4 AND t2.id = 5
+       AND t1.name = t2.name
+       AND t1.value = t2.value
+       AND t1.data = t2.data
+) t
+WHERE checksum1 IS NOT NULL 
+  AND checksum2 IS NOT NULL 
+  AND checksum1 != checksum2;
+
+-- Test I: Physical checksum changes when data is modified
 DO $$
 DECLARE
-    old_checksum integer;
-    new_checksum integer;
+    old_physical_checksum integer;
+    new_physical_checksum integer;
     test_passed boolean := false;
 BEGIN
-    -- Get original checksum
-    SELECT pg_tuple_checksum('test_basic'::regclass, ctid, false) 
-    INTO old_checksum
+    -- Get original physical checksum
+    SELECT pg_tuple_physical_checksum('test_basic'::regclass, ctid, false) 
+    INTO old_physical_checksum
     FROM test_basic WHERE id = 1;
     
     -- Modify the data
     UPDATE test_basic SET value = 999.99 WHERE id = 1;
     
-    -- Get new checksum
-    SELECT pg_tuple_checksum('test_basic'::regclass, ctid, false) 
-    INTO new_checksum
+    -- Get new physical checksum
+    SELECT pg_tuple_physical_checksum('test_basic'::regclass, ctid, false) 
+    INTO new_physical_checksum
     FROM test_basic WHERE id = 1;
     
     -- Test passes if checksums are different
-    IF old_checksum != new_checksum THEN
+    IF old_physical_checksum != new_physical_checksum THEN
         test_passed := true;
     END IF;
     
@@ -104,16 +143,111 @@ BEGIN
     UPDATE test_basic SET value = 100.5 WHERE id = 1;
     
     IF NOT test_passed THEN
-        RAISE EXCEPTION 'Test F failed: Checksum did not change after data modification';
+        RAISE EXCEPTION 'Test I failed: Physical checksum did not change after data modification';
     END IF;
 END;
 $$;
 
--- Test G: All checksums must be different
+-- Test J: Logical checksum changes when data is modified
+DO $$
+DECLARE
+    old_logical_checksum integer;
+    new_logical_checksum integer;
+    test_passed boolean := false;
+BEGIN
+    -- Get original logical checksum
+    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) 
+    INTO old_logical_checksum
+    FROM test_basic WHERE id = 1;
+    
+    -- Modify the data
+    UPDATE test_basic SET value = 999.99 WHERE id = 1;
+    
+    -- Get new logical checksum
+    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) 
+    INTO new_logical_checksum
+    FROM test_basic WHERE id = 1;
+    
+    -- Test passes if checksums are different
+    IF old_logical_checksum != new_logical_checksum THEN
+        test_passed := true;
+    END IF;
+    
+    -- Restore original value for other tests
+    UPDATE test_basic SET value = 100.5 WHERE id = 1;
+    
+    IF NOT test_passed THEN
+        RAISE EXCEPTION 'Test J failed: Logical checksum did not change after data modification';
+    END IF;
+END;
+$$;
+
+-- Test K: Table physical checksum should be non-zero
+DO $$
+DECLARE
+    table_physical_checksum bigint;
+BEGIN
+    SELECT pg_table_physical_checksum('test_basic'::regclass, false)
+    INTO table_physical_checksum;
+    
+    IF table_physical_checksum = 0 THEN
+        RAISE EXCEPTION 'Test K failed: Table physical checksum should be non-zero';
+    END IF;
+END;
+$$;
+
+-- Test L: Table logical checksum should be non-zero
+DO $$
+DECLARE
+    table_logical_checksum bigint;
+BEGIN
+    SELECT pg_table_logical_checksum('test_basic'::regclass)
+    INTO table_logical_checksum;
+    
+    IF table_logical_checksum IS NULL OR table_logical_checksum = 0 THEN
+        RAISE EXCEPTION 'Test L failed: Table logical checksum should be non-zero';
+    END IF;
+END;
+$$;
+
+-- Test M: All column checksums for name must be different
 SELECT 
     COUNT(DISTINCT pg_column_checksum('test_basic'::regclass, ctid, 2)) = 4 
     AS all_name_checksums_unique
 FROM test_basic;
+
+-- Test N: Page checksum test (requires specific block number)
+DO $$
+DECLARE
+    page_checksum integer;
+    test_block integer := 0; -- Assuming data is on block 0
+BEGIN
+    -- Try to get page checksum for block 0
+    SELECT pg_page_checksum('test_basic'::regclass, test_block)
+    INTO page_checksum;
+    
+    -- Page checksum could be 0 for new pages, but should not be NULL
+    IF page_checksum IS NULL THEN
+        RAISE EXCEPTION 'Test N failed: Page checksum returned NULL';
+    END IF;
+END;
+$$;
+
+-- Test O: Data checksum utility function
+SELECT 
+    pg_data_checksum(E'\\x01020304'::bytea, 0) != 0 AS data_checksum_works,
+    pg_data_checksum(E'\\x01020304'::bytea, 0) = 
+    pg_data_checksum(E'\\x01020304'::bytea, 0) AS same_data_same_checksum,
+    pg_data_checksum(E'\\x01020304'::bytea, 0) !=
+    pg_data_checksum(E'\\x01020305'::bytea, 0) AS different_data_different_checksum;
+
+-- Test P: Text checksum utility function
+SELECT 
+    pg_text_checksum('test', 0) != 0 AS text_checksum_works,
+    pg_text_checksum('test', 0) = 
+    pg_text_checksum('test', 0) AS same_text_same_checksum,
+    pg_text_checksum('test', 0) !=
+    pg_text_checksum('test2', 0) AS different_text_different_checksum;
 
 -- Clean up
 DROP TABLE test_basic;
