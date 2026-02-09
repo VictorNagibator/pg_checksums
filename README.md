@@ -416,4 +416,5 @@ make USE_PGXS=1 installcheck
 2. Physical and logical checksum differences
 3. NULL handling and type support
 4. MVCC behavior and concurrency
-5. Error conditions and edge cases
+5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
+6. Error conditions and edge cases
