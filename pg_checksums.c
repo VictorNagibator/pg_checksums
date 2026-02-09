@@ -90,6 +90,7 @@
 #include "access/brin.h"
 #include "access/brin_revmap.h"
 #include "access/brin_page.h"
+#include "access/xlogdefs.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
@@ -129,7 +130,6 @@ typedef struct IndexLogicalEntry
  *-------------------------------------------------------------------------
  */
 static List *find_primary_key_columns(Oid reloid);
-static uint32 compute_pk_seed(Relation rel, HeapTuple tuple, TupleDesc tupdesc, List *pk_columns);
 static uint32 pg_tuple_logical_checksum_internal(Relation rel, HeapTuple tuple, bool include_header);
 static bool index_supports_checksum(Oid amoid);
 static uint32 compute_generic_index_physical_checksum(Relation idxRel);
@@ -138,11 +138,6 @@ static uint32 compute_index_logical_checksum_internal(Relation idxRel);
 static uint32 pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
                                           int32 typmod, int attnum);
 static uint32 compute_order_independent_checksum(List *hash_list);
-static uint8 get_brin_page_type(Page page);
-static IndexLogicalEntry *extract_index_key_values(IndexTuple itup, TupleDesc idx_tupdesc);
-static void free_index_logical_entry(IndexLogicalEntry *entry);
-static uint32 compute_index_entry_hash(IndexLogicalEntry *entry);
-static int compare_index_entries(const void *a, const void *b);
 static uint64 compute_database_checksum_internal(bool physical, bool include_system, bool include_toast);
 static uint32 compute_typlen_byval_checksum(Datum value, Oid typid, int len, int attnum);
 static uint32 compute_checksum_for_data(const char *data, int len, int attnum);
@@ -248,11 +243,19 @@ combine_checksums_64(uint64 current, uint64 new_val)
 {
     uint64 hash = current;
     uint64 prime = UINT64CONST(1099511628211);
+    uint8 bytes[8];
+    int i;
     
-    /* Combine using FNV-1a with 8-byte chunks */
-    for (int i = 56; i >= 0; i -= 8)
+    /* Convert new_val to bytes in little-endian order */
+    for (i = 0; i < 8; i++)
     {
-        hash ^= (new_val >> i) & 0xFF;
+        bytes[i] = (new_val >> (i * 8)) & 0xFF;
+    }
+    
+    /* Process each byte with FNV-1a */
+    for (i = 0; i < 8; i++)
+    {
+        hash ^= bytes[i];
         hash *= prime;
     }
     
@@ -511,7 +514,7 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
     int         data_len;
     uint32      checksum;
 
-    /* Handle NULL values - return special sentinel value */
+    /* Handle NULL values - ALWAYS return special sentinel value */
     if (isnull)
         return CHECKSUM_NULL;
 
@@ -524,7 +527,7 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
 
     if (typeForm->typbyval && typeForm->typlen > 0)
     {
-        /* Fixed-length pass-by-value type (e.g., int4, int8, bool, float8) */
+        /* Fixed-length pass-by-value type */
         checksum = compute_typlen_byval_checksum(value, typid, 
                                                 typeForm->typlen, attnum);
     }
@@ -533,7 +536,7 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
         /* varlena type (text, bytea, arrays, etc.) */
         struct varlena *varlena;
         
-        /* Detoast if necessary - we need the actual data, not a toast pointer */
+        /* Detoast if necessary */
         varlena = PG_DETOAST_DATUM(value);
         
         data = (char *) varlena;
@@ -566,23 +569,23 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
 
     ReleaseSysCache(typeTuple);
     
-    /* 
-     * Critical safety guarantee: non-NULL values must never return 
-     * CHECKSUM_NULL or 0. This ensures that checksums can be used
-     * for equality comparisons without special NULL handling.
-     */
-    if (checksum == CHECKSUM_NULL || checksum == 0)
+    if (checksum == CHECKSUM_NULL)
     {
-        /*
-         * Generate a deterministic alternative checksum based on
-         * attribute number and type OID. The multipliers are prime
-         * numbers to reduce collision probability.
-         */
+        /* Generate deterministic alternative checksum */
         checksum = (attnum * 100003) ^ (typid * 100019);
         
-        /* Double-check: ensure it's not CHECKSUM_NULL or 0 */
-        if (checksum == CHECKSUM_NULL || checksum == 0)
-            checksum = 0x7FFFFFFF; /* A safe positive maximum value */
+        /* Ensure it's not CHECKSUM_NULL or 0 */
+        if (checksum == CHECKSUM_NULL)
+            checksum = 0x7FFFFFFE; /* A safe positive value */
+        if (checksum == 0)
+            checksum = 0x7FFFFFFD;
+    }
+
+    if (!isnull && checksum == 0)
+    {
+        checksum = (attnum * 100019) ^ (typid * 100003);
+        if (checksum == 0)
+            checksum = 0x7FFFFFFC;
     }
     
     return checksum;
@@ -703,7 +706,7 @@ pg_column_checksum(PG_FUNCTION_ARGS)
  * This is useful for detecting physical corruption and verifying that
  * tuples haven't moved unexpectedly.
  */
-uint32
+static uint32
 pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum, 
                                    BlockNumber blkno, bool include_header)
 {
@@ -712,7 +715,14 @@ pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum,
     char       *data;
     uint32      len;
     uint32      checksum;
+    uint64      location;
     uint32      location_hash;
+    uint32      page_info;
+    uint32      mvcc_info;
+    uint32      itemid_info;
+    PageHeader phdr = (PageHeader)page;
+    XLogRecPtr  page_lsn;
+    uint32      lsn_hi, lsn_lo;
     
     /* Validate offset number range */
     if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
@@ -742,26 +752,47 @@ pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum,
             return 0;
     }
 
-    /* Create location hash from block number and offset */
-    location_hash = (blkno << 16) | offnum;
+    /* Create 64-bit location from block number and offset */
+    location = ((uint64)blkno << 32) | (uint64)offnum;
+    
+    /* Calculate 32-bit hash of the location */
+    location_hash = fnv1a_32_hash(&location, sizeof(location), FNV_BASIS_32);
+    
+    /* Include page header information for additional uniqueness */
+    page_info = PageGetPageSize(page) | (PageGetPageLayoutVersion(page) << 16);
+    location_hash = combine_checksums(location_hash, page_info);
+    
+    /* Include Page LSN (64-bit) split into two 32-bit parts */
+    page_lsn = PageGetLSN(page); 
+    lsn_hi = (uint32)(page_lsn >> 32);
+    lsn_lo = (uint32)(page_lsn & 0xFFFFFFFF);
+    location_hash = combine_checksums(location_hash, lsn_hi);
+    location_hash = combine_checksums(location_hash, lsn_lo);
+    
+    /* Include other page metadata */
+    location_hash = combine_checksums(location_hash, phdr->pd_checksum);
+    location_hash = combine_checksums(location_hash, phdr->pd_flags);
     
     /* Calculate checksum using location_hash as the initial value */
     checksum = pg_checksum_data_custom(data, len, location_hash);
     
-    /* Additionally XOR with location_hash to guarantee uniqueness */
-    checksum ^= location_hash;
+    /* Incorporate MVCC information and other physical metadata */
+    mvcc_info = (HeapTupleHeaderGetRawXmin(tuple) ^ 
+                HeapTupleHeaderGetRawXmax(tuple) ^
+                HeapTupleHeaderGetRawCommandId(tuple));
+    checksum ^= mvcc_info;
     
-    /* Incorporate MVCC information when excluding header */
-    if (!include_header)
-    {
-        uint32 mvcc_info = (HeapTupleHeaderGetRawXmin(tuple) ^ 
-                           HeapTupleHeaderGetRawXmax(tuple));
-        checksum ^= mvcc_info;
-    }
+    /* Include ItemId information */
+    itemid_info = (ItemIdGetFlags(lp) << 24) | ItemIdGetLength(lp);
+    checksum = combine_checksums(checksum, itemid_info);
     
     /* Guarantee checksum never equals CHECKSUM_NULL */
     if (checksum == CHECKSUM_NULL)
         checksum = (CHECKSUM_NULL ^ location_hash) & 0xFFFFFFFE;
+
+    if (checksum == 0) {
+        checksum = (location_hash ^ mvcc_info ^ FNV_BASIS_32) & 0xFFFFFFFE;
+    }
     
     return checksum;
 }
@@ -896,59 +927,6 @@ find_primary_key_columns(Oid reloid)
 }
 
 /*
- * compute_pk_seed - Compute seed based on primary key values
- *
- * Computes a deterministic seed value based on the primary key values
- * of a tuple. This seed is then used to compute logical checksums.
- *
- * Returns 0 if:
- * 1. No primary key exists
- * 2. Primary key contains NULL values (invalid state)
- */
-static uint32
-compute_pk_seed(Relation rel, HeapTuple tuple, TupleDesc tupdesc, List *pk_columns)
-{
-    ListCell *lc;
-    bool pk_has_null = false;
-    uint32 seed = FNV_BASIS_32;
-    
-    if (pk_columns == NIL)
-        return 0; /* No PK */
-    
-    foreach(lc, pk_columns)
-    {
-        int attnum = lfirst_int(lc);
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
-        Datum value;
-        bool isnull;
-        uint32 col_checksum;
-        
-        value = heap_getattr(tuple, attnum, tupdesc, &isnull);
-        
-        if (isnull)
-        {
-            /* Primary key cannot contain NULL, but handle gracefully */
-            pk_has_null = true;
-            continue;
-        }
-        
-        /* Compute column checksum with seed=0 */
-        col_checksum = pg_column_checksum_internal(value, false,
-                                                   attr->atttypid,
-                                                   attr->atttypmod,
-                                                   0);
-        
-        /* Combine with overall seed using FNV-1a */
-        seed = fnv1a_32_hash(&col_checksum, sizeof(col_checksum), seed);
-    }
-    
-    if (pk_has_null)
-        return 0; /* Invalid PK */
-    
-    return seed;
-}
-
-/*
  * pg_tuple_logical_checksum_internal - Core logical tuple checksum
  *
  * Computes a logical checksum for a tuple that depends only on its
@@ -969,54 +947,78 @@ pg_tuple_logical_checksum_internal(Relation rel, HeapTuple tuple, bool include_h
 {
     TupleDesc tupdesc = RelationGetDescr(rel);
     List *pk_columns = find_primary_key_columns(RelationGetRelid(rel));
-    uint32 seed;
-    uint32 checksum;
-    HeapTupleHeader tup = tuple->t_data;
-    char *data;
-    uint32 len;
+    uint32 checksum = FNV_BASIS_32;
+    int i;
+    ListCell *lc;
     
     if (pk_columns == NIL)
     {
-        list_free(pk_columns);
-        return 0; /* No PK, cannot compute logical checksum */
+        return 0; /* No PK, can't compute logical checksum */
     }
     
-    /* Compute seed based on PK values */
-    seed = compute_pk_seed(rel, tuple, tupdesc, pk_columns);
+    /* First, hash all PK columns to create a deterministic base */
+    foreach(lc, pk_columns)
+    {
+        int attnum = lfirst_int(lc);
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+        Datum value;
+        bool isnull;
+        uint32 col_hash;
+        
+        value = heap_getattr(tuple, attnum, tupdesc, &isnull);
+        
+        if (isnull)
+        {
+            /* PK can't have NULLs, but handle gracefully */
+            list_free(pk_columns);
+            return 0;
+        }
+        
+        col_hash = pg_column_checksum_internal(value, false,
+                                              attr->atttypid,
+                                              attr->atttypmod,
+                                              attnum);
+        
+        checksum = combine_checksums(checksum, col_hash);
+    }
+    
     list_free(pk_columns);
     
-    if (seed == 0)
-        return 0; /* Failed to compute seed */
-    
-    /* Determine data to hash */
     if (include_header)
     {
-        data = (char *) tup;
-        len = tuple->t_len;
-    }
-    else
-    {
-        data = (char *) tup + tup->t_hoff;
-        len = tuple->t_len - tup->t_hoff;
+        /* Include tuple header in the checksum */
+        HeapTupleHeader tup = tuple->t_data;
+        char *header_data = (char *)tup;
+        uint32 header_len = tup->t_hoff; /* Just the header part */
         
-        if (len <= 0)
-            return 0;
+        /* Hash the header */
+        uint32 header_hash = fnv1a_32_hash(header_data, header_len, checksum);
+        checksum = header_hash;
     }
     
-    /* Compute checksum with PK-based seed */
-    checksum = pg_checksum_data_custom(data, len, seed);
-    
-    /* Include MVCC information when excluding header */
-    if (!include_header)
+    /* Always include all column values */
+    for (i = 1; i <= tupdesc->natts; i++)
     {
-        uint32 mvcc_info = (HeapTupleHeaderGetRawXmin(tup) ^ 
-                           HeapTupleHeaderGetRawXmax(tup));
-        checksum ^= mvcc_info;
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+        Datum value;
+        bool isnull;
+        uint32 col_hash;
+        
+        value = heap_getattr(tuple, i, tupdesc, &isnull);
+        
+        col_hash = pg_column_checksum_internal(value, isnull,
+                                              attr->atttypid,
+                                              attr->atttypmod,
+                                              i);
+        
+        checksum = combine_checksums(checksum, col_hash);
     }
     
-    /* Guarantee checksum never equals CHECKSUM_NULL */
-    if (checksum == CHECKSUM_NULL)
-        checksum = (CHECKSUM_NULL ^ seed) & 0xFFFFFFFE;
+    /* Ensure non-zero and non-NULL result */
+    if (checksum == CHECKSUM_NULL || checksum == 0)
+    {
+        checksum = (checksum ^ FNV_BASIS_32) & 0xFFFFFFFE;
+    }
     
     return checksum;
 }
@@ -1129,6 +1131,7 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
     List       *tuple_hashes = NIL;
     uint32      aggregate;
     uint64      final_checksum;
+    uint32      relation_hash;
     
     if (PG_ARGISNULL(0))
         PG_RETURN_NULL();
@@ -1138,6 +1141,11 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
     
     /* Open relation */
     rel = relation_open(reloid, AccessShareLock);
+    
+    /* Include relation metadata in checksum */
+    relation_hash = fnv1a_32_hash(&reloid, sizeof(reloid), FNV_BASIS_32);
+    relation_hash = combine_checksums(relation_hash, rel->rd_rel->relpages);
+    relation_hash = combine_checksums(relation_hash, rel->rd_rel->reltuples);
     
     /* Start table scan */
     scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
@@ -1175,11 +1183,23 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
     /* Compute order-independent aggregate */
     aggregate = compute_order_independent_checksum(tuple_hashes);
     
-    /* Include relation OID in final checksum */
+    /* Combine with relation metadata */
+    aggregate = combine_checksums(aggregate, relation_hash);
+    
+    if (aggregate == FNV_BASIS_32) {
+        /* Guarantee hash for empty tables */
+        aggregate = fnv1a_32_hash(&reloid, sizeof(reloid), FNV_BASIS_32);
+    }
+
+    if (aggregate == 0) {
+        aggregate = 0x7FFFFFFF;
+    }
+    
+    /* Include relation OID in final checksum (64-bit) */
     if (tuple_hashes != NIL)
         list_free(tuple_hashes);
     
-    /* Combine with relation OID for uniqueness (64-bit) */
+    /* Combine aggregate hash (upper 32 bits) with OID (lower 32 bits) */
     final_checksum = ((uint64)aggregate << 32) | reloid;
     
     PG_RETURN_INT64((int64)final_checksum);
@@ -1208,6 +1228,7 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
     List       *pk_columns;
     uint32      aggregate;
     uint64      final_checksum;
+    bool        has_valid_pk = true;
     
     if (PG_ARGISNULL(0))
         PG_RETURN_NULL();
@@ -1223,33 +1244,37 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
     {
         list_free(pk_columns);
         relation_close(rel, AccessShareLock);
-        PG_RETURN_NULL();  /* Return NULL without warning - expected behavior */
+        PG_RETURN_NULL();
     }
-    list_free(pk_columns);
     
-    /* Start table scan */
+    /* Verify PK doesn't contain NULLs in any tuple */
     scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
-    
-    /* Process each tuple in the table */
     while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
     {
-        uint32 tuple_checksum;
-        
-        /* Compute logical tuple checksum */
-        tuple_checksum = pg_tuple_logical_checksum_internal(rel, tuple, false);
-        
-        if (tuple_checksum != 0)
-            tuple_hashes = lappend_int(tuple_hashes, tuple_checksum);
+        uint32 tuple_checksum = pg_tuple_logical_checksum_internal(rel, tuple, false);
+        if (tuple_checksum == 0)
+        {
+            has_valid_pk = false;
+            break;
+        }
+        tuple_hashes = lappend_int(tuple_hashes, tuple_checksum);
+    }
+    table_endscan(scan);
+    
+    if (!has_valid_pk)
+    {
+        list_free(pk_columns);
+        list_free(tuple_hashes);
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
     }
     
-    /* Clean up */
-    table_endscan(scan);
     relation_close(rel, AccessShareLock);
+    list_free(pk_columns);
     
     /* Compute order-independent aggregate */
     aggregate = compute_order_independent_checksum(tuple_hashes);
     
-    /* Include relation OID in final checksum */
     if (tuple_hashes != NIL)
         list_free(tuple_hashes);
     
@@ -1286,20 +1311,6 @@ index_supports_checksum(Oid amoid)
             amoid == BRIN_AM_OID);
 }
 
-/*
- * get_brin_page_type - Determine BRIN page type
- *
- * BRIN indexes have special page types stored in the special space.
- * This function extracts the page type byte.
- */
-static uint8
-get_brin_page_type(Page page)
-{
-    uint8 *special_space;
-    
-    special_space = (uint8 *)PageGetSpecialPointer(page);
-    return special_space[0];
-}
 
 /*-------------------------------------------------------------------------
  * Physical Index Checksum Functions
@@ -1319,54 +1330,61 @@ compute_generic_index_physical_checksum(Relation idxRel)
     BlockNumber nblocks;
     BufferAccessStrategy bstrategy;
     BlockNumber blkno;
-    List *tuple_hashes = NIL;
+    List *page_hashes = NIL;
+    uint32 index_type_hash;
+    uint32 aggregate;
+    Size page_size;
     
     nblocks = RelationGetNumberOfBlocks(idxRel);
     bstrategy = GetAccessStrategy(BAS_BULKREAD);
+    
+    /* Include index metadata in checksum */
+    index_type_hash = fnv1a_32_hash(&idxRel->rd_rel->relam, sizeof(Oid), FNV_BASIS_32);
+    index_type_hash = combine_checksums(index_type_hash, idxRel->rd_rel->relnatts);
     
     for (blkno = 0; blkno < nblocks; blkno++)
     {
         Buffer buffer;
         Page page;
-        OffsetNumber maxoff;
+        uint32 page_hash;
+        PageHeader phdr;
         
         buffer = ReadBufferExtended(idxRel, MAIN_FORKNUM, blkno,
                                    RBM_NORMAL, bstrategy);
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         
         page = BufferGetPage(buffer);
+        page_size = PageGetPageSize(page);
         
         if (!PageIsNew(page))
         {
-            maxoff = PageGetMaxOffsetNumber(page);
+            /* Hash the entire page using actual page size */
+            page_hash = fnv1a_32_hash((char *)page, page_size, 0);
             
-            for (OffsetNumber offnum = FirstOffsetNumber;
-                 offnum <= maxoff;
-                 offnum = OffsetNumberNext(offnum))
-            {
-                ItemId itemId;
-                
-                itemId = PageGetItemId(page, offnum);
-                
-                if (ItemIdIsUsed(itemId) && !ItemIdIsDead(itemId))
-                {
-                    IndexTuple itup;
-                    Size itup_len;
-                    uint32 tuple_hash;
-                    
-                    itup = (IndexTuple) PageGetItem(page, itemId);
-                    itup_len = IndexTupleSize(itup);
-                    
-                    /* Hash the physical index tuple */
-                    tuple_hash = fnv1a_32_hash((char *)itup, itup_len, 0);
-                    
-                    /* Include physical location for uniqueness */
-                    tuple_hash = combine_checksums(tuple_hash, blkno);
-                    tuple_hash = combine_checksums(tuple_hash, offnum);
-                    
-                    tuple_hashes = lappend_int(tuple_hashes, tuple_hash);
-                }
-            }
+            /* Include page header details */
+            phdr = (PageHeader)page;
+            page_hash = combine_checksums(page_hash, phdr->pd_lower);
+            page_hash = combine_checksums(page_hash, phdr->pd_upper);
+            page_hash = combine_checksums(page_hash, phdr->pd_special);
+            
+            /* Include block number for uniqueness */
+            page_hash = combine_checksums(page_hash, blkno);
+            
+            /* Include page flags */
+            page_hash = combine_checksums(page_hash, phdr->pd_flags);
+            
+            /* Include page size for additional uniqueness */
+            page_hash = combine_checksums(page_hash, (uint32)page_size);
+            
+            page_hashes = lappend_int(page_hashes, page_hash);
+        }
+        else
+        {
+            /* New pages contribute to checksum too */
+            page_hash = fnv1a_32_hash("NEW_PAGE", 8, blkno);
+            /* Include page size even for new pages */
+            page_hash = combine_checksums(page_hash, (uint32)page_size);
+            page_hashes = lappend_int(page_hashes, page_hash);
         }
         
         UnlockReleaseBuffer(buffer);
@@ -1378,7 +1396,15 @@ compute_generic_index_physical_checksum(Relation idxRel)
     
     FreeAccessStrategy(bstrategy);
     
-    return compute_order_independent_checksum(tuple_hashes);
+    /* Combine page hashes with index metadata */
+    aggregate = compute_order_independent_checksum(page_hashes);
+    aggregate = combine_checksums(aggregate, index_type_hash);
+    
+    /* Free the list */
+    if (page_hashes != NIL)
+        list_free(page_hashes);
+    
+    return aggregate;
 }
 
 /*
@@ -1394,7 +1420,8 @@ compute_brin_index_physical_checksum(Relation idxRel)
     BlockNumber nblocks;
     BufferAccessStrategy bstrategy;
     BlockNumber blkno;
-    List *tuple_hashes = NIL;
+    List *page_hashes = NIL;
+    Size page_size;
     
     nblocks = RelationGetNumberOfBlocks(idxRel);
     bstrategy = GetAccessStrategy(BAS_BULKREAD);
@@ -1403,25 +1430,56 @@ compute_brin_index_physical_checksum(Relation idxRel)
     {
         Buffer buffer;
         Page page;
+        uint32 page_hash;
         
         buffer = ReadBufferExtended(idxRel, MAIN_FORKNUM, blkno,
                                    RBM_NORMAL, bstrategy);
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         
         page = BufferGetPage(buffer);
+        page_size = PageGetPageSize(page);
         
         if (!PageIsNew(page))
         {
-            /* Get page checksum - include page type for BRIN */
-            uint32 page_hash = fnv1a_32_hash((char *)page, BLCKSZ, 0);
+            uint8 *special_space;
+            Size special_size;
+            PageHeader phdr;
+
+            /* Hash the page using actual page size */
+            page_hash = fnv1a_32_hash((char *)page, page_size, 0);
             
-            /* Add page type information */
-            uint8 page_type = get_brin_page_type(page);
-            page_hash = combine_checksums(page_hash, (uint32)page_type);
+            /* Include page size */
+            page_hash = combine_checksums(page_hash, (uint32)page_size);
+            
+            /* Get BRIN special space */
+            special_space = (uint8 *)PageGetSpecialPointer(page);
+            special_size = PageGetSpecialSize(page);
+            
+            /* Include BRIN-specific information from special space */
+            if (special_size >= 4)
+            {
+                /* First 4 bytes of BRIN special space typically contain type and metadata */
+                uint32 brin_info = 0;
+                memcpy(&brin_info, special_space, 4);
+                page_hash = combine_checksums(page_hash, brin_info);
+            }
+            
+            /* Include block number */
             page_hash = combine_checksums(page_hash, blkno);
             
-            /* Store page hash */
-            tuple_hashes = lappend_int(tuple_hashes, page_hash);
+            /* Include page header info */
+            phdr = (PageHeader)page;
+            page_hash = combine_checksums(page_hash, phdr->pd_lower);
+            page_hash = combine_checksums(page_hash, phdr->pd_upper);
+            page_hash = combine_checksums(page_hash, phdr->pd_flags);
+            
+            page_hashes = lappend_int(page_hashes, page_hash);
+        }
+        else
+        {
+            page_hash = fnv1a_32_hash("BRIN_NEW", 8, blkno);
+            page_hash = combine_checksums(page_hash, (uint32)page_size);
+            page_hashes = lappend_int(page_hashes, page_hash);
         }
         
         UnlockReleaseBuffer(buffer);
@@ -1432,7 +1490,14 @@ compute_brin_index_physical_checksum(Relation idxRel)
     
     FreeAccessStrategy(bstrategy);
     
-    return compute_order_independent_checksum(tuple_hashes);
+    if (page_hashes != NIL)
+    {
+        uint32 result = compute_order_independent_checksum(page_hashes);
+        list_free(page_hashes);
+        return result;
+    }
+    
+    return FNV_BASIS_32;
 }
 
 /*
@@ -1506,120 +1571,6 @@ pg_index_physical_checksum(PG_FUNCTION_ARGS)
  */
 
 /*
- * Index Logical Checksum Helper Functions
- *
- * These functions extract and process index key values for logical
- * checksums, which depend only on the logical content of the index
- * (key values and heap TIDs), not on the physical index structure.
- */
-
-static IndexLogicalEntry *
-extract_index_key_values(IndexTuple itup, TupleDesc idx_tupdesc)
-{
-    IndexLogicalEntry *entry;
-    Datum *values;
-    bool *isnull;
-    uint32 *key_hashes;
-    int nkeys = idx_tupdesc->natts;
-    int i;
-    
-    entry = (IndexLogicalEntry *)palloc(sizeof(IndexLogicalEntry));
-    values = (Datum *)palloc(nkeys * sizeof(Datum));
-    isnull = (bool *)palloc(nkeys * sizeof(bool));
-    key_hashes = (uint32 *)palloc(nkeys * sizeof(uint32));
-    
-    /* Extract index key values from the index tuple */
-    index_deform_tuple(itup, idx_tupdesc, values, isnull);
-    
-    /* Compute hash for each key */
-    for (i = 0; i < nkeys; i++)
-    {
-        if (isnull[i])
-        {
-            key_hashes[i] = CHECKSUM_NULL;
-        }
-        else
-        {
-            Form_pg_attribute attr = TupleDescAttr(idx_tupdesc, i);
-            key_hashes[i] = pg_column_checksum_internal(values[i], false,
-                                                        attr->atttypid,
-                                                        attr->atttypmod,
-                                                        i + 1);
-        }
-    }
-    
-    entry->key_values = values;
-    entry->key_nulls = isnull;
-    entry->key_hashes = key_hashes;
-    entry->nkeys = nkeys;
-    entry->tid = itup->t_tid;
-    entry->entry_hash = 0;
-    
-    return entry;
-}
-
-static void
-free_index_logical_entry(IndexLogicalEntry *entry)
-{
-    if (entry->key_values)
-        pfree(entry->key_values);
-    if (entry->key_nulls)
-        pfree(entry->key_nulls);
-    if (entry->key_hashes)
-        pfree(entry->key_hashes);
-    pfree(entry);
-}
-
-static uint32
-compute_index_entry_hash(IndexLogicalEntry *entry)
-{
-    uint32 hash = FNV_BASIS_32;
-    int i;
-    
-    /* Combine all key hashes */
-    for (i = 0; i < entry->nkeys; i++)
-    {
-        hash = combine_checksums(hash, entry->key_hashes[i]);
-    }
-    
-    /* Add TID for uniqueness */
-    hash = combine_checksums(hash, ItemPointerGetBlockNumber(&entry->tid));
-    hash = combine_checksums(hash, ItemPointerGetOffsetNumber(&entry->tid));
-    
-    return hash;
-}
-
-static int
-compare_index_entries(const void *a, const void *b)
-{
-    const IndexLogicalEntry *entry_a = *(const IndexLogicalEntry **)a;
-    const IndexLogicalEntry *entry_b = *(const IndexLogicalEntry **)b;
-    int i;
-    
-    /* Compare key hashes (logical key values) */
-    for (i = 0; i < entry_a->nkeys && i < entry_b->nkeys; i++)
-    {
-        if (entry_a->key_hashes[i] < entry_b->key_hashes[i])
-            return -1;
-        if (entry_a->key_hashes[i] > entry_b->key_hashes[i])
-            return 1;
-    }
-    
-    /* If keys are equal, compare TIDs */
-    if (ItemPointerGetBlockNumber(&entry_a->tid) < ItemPointerGetBlockNumber(&entry_b->tid))
-        return -1;
-    if (ItemPointerGetBlockNumber(&entry_a->tid) > ItemPointerGetBlockNumber(&entry_b->tid))
-        return 1;
-    
-    if (ItemPointerGetOffsetNumber(&entry_a->tid) < ItemPointerGetOffsetNumber(&entry_b->tid))
-        return -1;
-    if (ItemPointerGetOffsetNumber(&entry_a->tid) > ItemPointerGetOffsetNumber(&entry_b->tid))
-        return 1;
-    
-    return 0;
-}
-
-/*
  * compute_index_logical_checksum_internal - Core logical index checksum
  *
  * Computes a logical checksum for an index that depends only on:
@@ -1635,13 +1586,10 @@ compute_index_logical_checksum_internal(Relation idxRel)
     BlockNumber nblocks;
     BufferAccessStrategy bstrategy;
     BlockNumber blkno;
-    List *entries = NIL;
-    uint32 aggregate;
+    List *entry_hashes = NIL;
     TupleDesc idx_tupdesc = RelationGetDescr(idxRel);
-    int num_entries;
-    IndexLogicalEntry **entries_array;
-    int i;
-    ListCell *lc;
+    Oid relid = RelationGetRelid(idxRel);
+    uint32 result;
     
     nblocks = RelationGetNumberOfBlocks(idxRel);
     bstrategy = GetAccessStrategy(BAS_BULKREAD);
@@ -1673,15 +1621,48 @@ compute_index_logical_checksum_internal(Relation idxRel)
                 if (ItemIdIsUsed(itemId) && !ItemIdIsDead(itemId))
                 {
                     IndexTuple itup;
-                    IndexLogicalEntry *entry;
+                    Datum *values;
+                    bool *isnull;
+                    int i;
+                    uint32 entry_hash = FNV_BASIS_32;
+                    ItemPointerData tid;
+                    uint32 tid_hash;
                     
                     itup = (IndexTuple) PageGetItem(page, itemId);
-                    entry = extract_index_key_values(itup, idx_tupdesc);
                     
-                    /* Compute hash for this entry and store it */
-                    entry->entry_hash = compute_index_entry_hash(entry);
+                    /* Extract index key values */
+                    values = (Datum *)palloc(idx_tupdesc->natts * sizeof(Datum));
+                    isnull = (bool *)palloc(idx_tupdesc->natts * sizeof(bool));
                     
-                    entries = lappend(entries, entry);
+                    index_deform_tuple(itup, idx_tupdesc, values, isnull);
+                    
+                    /* Hash each key value */
+                    for (i = 0; i < idx_tupdesc->natts; i++)
+                    {
+                        if (isnull[i])
+                        {
+                            entry_hash = combine_checksums(entry_hash, CHECKSUM_NULL);
+                        }
+                        else
+                        {
+                            Form_pg_attribute attr = TupleDescAttr(idx_tupdesc, i);
+                            uint32 col_hash = pg_column_checksum_internal(values[i], false,
+                                                                         attr->atttypid,
+                                                                         attr->atttypmod,
+                                                                         i + 1);
+                            entry_hash = combine_checksums(entry_hash, col_hash);
+                        }
+                    }
+                    
+                    /* Hash the heap TID */
+                    tid = itup->t_tid;
+                    tid_hash = fnv1a_32_hash(&tid, sizeof(tid), 0);
+                    entry_hash = combine_checksums(entry_hash, tid_hash);
+                    
+                    pfree(values);
+                    pfree(isnull);
+                    
+                    entry_hashes = lappend_int(entry_hashes, entry_hash);
                 }
             }
         }
@@ -1695,42 +1676,17 @@ compute_index_logical_checksum_internal(Relation idxRel)
     FreeAccessStrategy(bstrategy);
     
     /* For empty indexes, return hash of relation OID */
-    if (entries == NIL)
+    if (entry_hashes == NIL)
     {
-        Oid relid = RelationGetRelid(idxRel);
         return fnv1a_32_hash(&relid, sizeof(relid), FNV_BASIS_32);
     }
     
-    /* Convert to array and sort for order-independent aggregation */
-    num_entries = list_length(entries);
-    entries_array = (IndexLogicalEntry **)palloc(num_entries * sizeof(IndexLogicalEntry *));
-    i = 0;
+    /* Sort hashes for order-independent aggregation */
+    result = compute_order_independent_checksum(entry_hashes);
     
-    foreach(lc, entries)
-    {
-        entries_array[i++] = (IndexLogicalEntry *)lfirst(lc);
-    }
+    list_free(entry_hashes);
     
-    qsort(entries_array, num_entries, sizeof(IndexLogicalEntry *),
-          compare_index_entries);
-    
-    /* Compute aggregate hash from sorted entries */
-    aggregate = FNV_BASIS_32;
-    for (i = 0; i < num_entries; i++)
-    {
-        IndexLogicalEntry *entry = entries_array[i];
-        aggregate = combine_checksums(aggregate, entry->entry_hash);
-    }
-    
-    /* Clean up */
-    for (i = 0; i < num_entries; i++)
-    {
-        free_index_logical_entry(entries_array[i]);
-    }
-    pfree(entries_array);
-    list_free(entries);
-    
-    return aggregate;
+    return result;
 }
 
 /*

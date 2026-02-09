@@ -1,0 +1,191 @@
+-- Comprehensive Checksum Stability Test (Deterministic)
+-- Tests logical checksum stability after VACUUM, CLUSTER, and REINDEX operations
+-- Create test table with various data types to test different scenarios
+CREATE TABLE test_checksum_stability (
+    id integer PRIMARY KEY,
+    name text NOT NULL,
+    value integer NOT NULL,
+    category varchar(20),
+    active boolean DEFAULT true,
+    created_date timestamp DEFAULT '2023-01-01 00:00:00',
+    data jsonb,
+    padding char(300) DEFAULT 'x'
+);
+-- Insert data in RANDOM order to ensure CLUSTER will reorder
+INSERT INTO test_checksum_stability (id, name, value, category, data)
+SELECT 
+    gs,
+    'user_' || gs,
+    (random() * 10000)::integer,  -- Random values to ensure unsorted order
+    CASE (gs % 5) 
+        WHEN 0 THEN 'A' 
+        WHEN 1 THEN 'B' 
+        WHEN 2 THEN 'C' 
+        WHEN 3 THEN 'D' 
+        ELSE 'E' 
+    END,
+    jsonb_build_object('id', gs, 'value', gs * 100)
+FROM generate_series(1, 100) gs;
+-- Create indexes for testing
+CREATE INDEX idx_test_stability_value ON test_checksum_stability (value);
+-- Test 1: Baseline - verify checksum functionality works
+SELECT 
+    'Baseline verification' as test_phase,
+    COUNT(*) = 100 as has_100_rows,
+    COUNT(DISTINCT pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false)) = 100 
+        AS all_logical_checksums_unique,
+    pg_table_logical_checksum('test_checksum_stability'::regclass) IS NOT NULL 
+        AS table_logical_checksum_not_null,
+    pg_table_physical_checksum('test_checksum_stability'::regclass, false) IS NOT NULL 
+        AS table_physical_checksum_not_null
+FROM test_checksum_stability t;
+      test_phase       | has_100_rows | all_logical_checksums_unique | table_logical_checksum_not_null | table_physical_checksum_not_null 
+-----------------------+--------------+------------------------------+---------------------------------+----------------------------------
+ Baseline verification | t            | t                            | t                               | t
+(1 row)
+
+-- Store baseline logical checksums for ALL rows
+CREATE TEMP TABLE baseline_checksums AS
+SELECT 
+    id,
+    ctid as baseline_ctid,
+    pg_tuple_logical_checksum('test_checksum_stability'::regclass, ctid, false) as baseline_logical
+FROM test_checksum_stability;
+-- Phase 1: VACUUM (not FULL)
+VACUUM test_checksum_stability;
+-- Verify logical checksums remain the same after VACUUM
+SELECT 
+    'After VACUUM (not FULL)' as test_phase,
+    COUNT(*) = 100 as all_rows_found,
+    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false) THEN 1 END) = 100
+        AS all_logical_checksums_match
+FROM baseline_checksums b
+JOIN test_checksum_stability t ON b.id = t.id;
+       test_phase        | all_rows_found | all_logical_checksums_match 
+-------------------------+----------------+-----------------------------
+ After VACUUM (not FULL) | t              | t
+(1 row)
+
+-- Phase 2: VACUUM FULL
+VACUUM FULL test_checksum_stability;
+-- After VACUUM FULL, logical checksums should remain the same
+SELECT 
+    'After VACUUM FULL' as test_phase,
+    COUNT(*) = 100 as all_rows_found,
+    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false) THEN 1 END) = 100
+        AS all_logical_checksums_match
+FROM baseline_checksums b
+JOIN test_checksum_stability t ON b.id = t.id;
+    test_phase     | all_rows_found | all_logical_checksums_match 
+-------------------+----------------+-----------------------------
+ After VACUUM FULL | t              | t
+(1 row)
+
+-- Phase 3: CLUSTER - should reorder table by value ASC
+-- Verify table is NOT sorted by value before CLUSTER
+SELECT 
+    'Before CLUSTER' as test_phase,
+    COUNT(*) > 0 AS has_unsorted_pairs
+FROM (
+    SELECT value, ctid,
+           lag(value) OVER (ORDER BY ctid) as prev_value
+    FROM test_checksum_stability
+    LIMIT 10
+) t
+WHERE prev_value IS NOT NULL AND value < prev_value;
+   test_phase   | has_unsorted_pairs 
+----------------+--------------------
+ Before CLUSTER | t
+(1 row)
+
+-- Store ctids before CLUSTER
+CREATE TEMP TABLE before_cluster AS
+SELECT id, ctid as before_ctid
+FROM test_checksum_stability;
+CLUSTER test_checksum_stability USING idx_test_stability_value;
+-- Verify table IS sorted by value after CLUSTER
+SELECT 
+    'After CLUSTER - ordering' as test_phase,
+    COUNT(*) = 0 AS is_perfectly_sorted
+FROM (
+    SELECT value, ctid,
+           lag(value) OVER (ORDER BY ctid) as prev_value
+    FROM test_checksum_stability
+) t
+WHERE prev_value IS NOT NULL AND value < prev_value;
+        test_phase        | is_perfectly_sorted 
+--------------------------+---------------------
+ After CLUSTER - ordering | t
+(1 row)
+
+-- Verify logical checksums remain the same after CLUSTER
+SELECT 
+    'After CLUSTER - checksums' as test_phase,
+    COUNT(*) = 100 as all_rows_found,
+    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false) THEN 1 END) = 100
+        AS all_logical_checksums_match
+FROM baseline_checksums b
+JOIN test_checksum_stability t ON b.id = t.id;
+        test_phase         | all_rows_found | all_logical_checksums_match 
+---------------------------+----------------+-----------------------------
+ After CLUSTER - checksums | t              | t
+(1 row)
+
+-- Phase 4: REINDEX - rebuild indexes
+-- Store index checksums before REINDEX
+CREATE TEMP TABLE before_reindex AS
+SELECT 
+    'idx_test_stability_value' as index_name,
+    pg_index_logical_checksum('idx_test_stability_value'::regclass) as logical_before,
+    pg_index_physical_checksum('idx_test_stability_value'::regclass) as physical_before;
+REINDEX TABLE test_checksum_stability;
+-- Check index checksum properties
+SELECT 
+    'After REINDEX' as test_phase,
+    b.logical_before = pg_index_logical_checksum(b.index_name::regclass) 
+        AS logical_checksum_unchanged,
+    b.physical_before != pg_index_physical_checksum(b.index_name::regclass) 
+        AS physical_checksum_changed
+FROM before_reindex b;
+  test_phase   | logical_checksum_unchanged | physical_checksum_changed 
+---------------+----------------------------+---------------------------
+ After REINDEX | t                          | t
+(1 row)
+
+-- Phase 5: Test column checksums
+SELECT 
+    'Column checksums test' as test_phase,
+    COUNT(DISTINCT pg_column_checksum('test_checksum_stability'::regclass, ctid, 1)) = 100
+        AS pk_column_checksums_unique,
+    COUNT(CASE WHEN active IS NULL AND 
+        pg_column_checksum('test_checksum_stability'::regclass, ctid, 5) = -1 
+        THEN 1 END) = COUNT(*) FILTER (WHERE active IS NULL)
+        AS null_column_checksums_correct
+FROM test_checksum_stability;
+      test_phase       | pk_column_checksums_unique | null_column_checksums_correct 
+-----------------------+----------------------------+-------------------------------
+ Column checksums test | t                          | t
+(1 row)
+
+-- Final summary
+SELECT 
+    'FINAL SUMMARY' as test_phase,
+    pg_table_logical_checksum('test_checksum_stability'::regclass) IS NOT NULL 
+        AND pg_table_logical_checksum('test_checksum_stability'::regclass) != 0
+        AS table_logical_checksum_valid,
+    pg_table_physical_checksum('test_checksum_stability'::regclass, false) IS NOT NULL 
+        AND pg_table_physical_checksum('test_checksum_stability'::regclass, false) != 0
+        AS table_physical_checksum_valid,
+    (SELECT COUNT(*) FROM test_checksum_stability) = 100
+        AS row_count_correct
+FROM test_checksum_stability
+LIMIT 1;
+  test_phase   | table_logical_checksum_valid | table_physical_checksum_valid | row_count_correct 
+---------------+------------------------------+-------------------------------+-------------------
+ FINAL SUMMARY | t                            | t                             | t
+(1 row)
+
+-- Cleanup
+DROP TABLE baseline_checksums;
+DROP TABLE before_cluster;
+DROP TABLE before_reindex;

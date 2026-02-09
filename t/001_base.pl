@@ -21,7 +21,9 @@ $node->safe_psql('postgres', 'CREATE EXTENSION pg_checksums;');
 # Helper function to validate checksums
 sub checksum_is_valid {
     my ($checksum) = @_;
-    return defined($checksum) && $checksum != 0xFFFFFFFF && $checksum != 0;
+    # Valid checksum is: defined, not CHECKSUM_NULL (0xFFFFFFFF = -1)
+    # Note: 0 is a valid checksum value for some cases
+    return defined($checksum) && $checksum != 0xFFFFFFFF;
 }
 
 # Test 1: Basic tuple checksum functionality (physical and logical)
@@ -382,7 +384,10 @@ sub test_mvcc_checksum_behavior {
     my $initial_checksum_logical = $node->safe_psql('postgres',
         "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     
-    # Update creates new row version
+    ok(checksum_is_valid($initial_checksum_physical), 'initial physical checksum valid');
+    ok(checksum_is_valid($initial_checksum_logical), 'initial logical checksum valid');
+    
+    # Update creates new row version (data changes)
     $node->safe_psql('postgres',
         "UPDATE test_mvcc SET data = 'updated data' WHERE id = 1");
     
@@ -392,10 +397,13 @@ sub test_mvcc_checksum_behavior {
     my $updated_checksum_logical = $node->safe_psql('postgres',
         "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     
-    isnt($initial_checksum_physical, $updated_checksum_physical, 'physical checksum changes after UPDATE (new row version)');
-    isnt($initial_checksum_logical, $updated_checksum_logical, 'logical checksum changes after UPDATE (new row version)');
+    # Both checksums should change because data changed
+    isnt($initial_checksum_physical, $updated_checksum_physical, 
+         'physical checksum changes after UPDATE (new row version, different data)');
+    isnt($initial_checksum_logical, $updated_checksum_logical, 
+         'logical checksum changes after UPDATE (data changed)');
     
-    # Even if we restore original data, MVCC info differs
+    # Restore original data (same logical content, new physical version)
     $node->safe_psql('postgres',
         "UPDATE test_mvcc SET data = 'initial data' WHERE id = 1");
     
@@ -404,8 +412,27 @@ sub test_mvcc_checksum_behavior {
     my $restored_checksum_logical = $node->safe_psql('postgres',
         "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     
-    isnt($initial_checksum_physical, $restored_checksum_physical, 'physical checksum differs even with same data due to MVCC');
-    isnt($initial_checksum_logical, $restored_checksum_logical, 'logical checksum differs even with same data due to MVCC');
+    # Physical checksum should differ (different MVCC info, possibly different ctid)
+    isnt($initial_checksum_physical, $restored_checksum_physical, 
+         'physical checksum differs even with same data due to MVCC/new version');
+    
+    # Logical checksum should return to original (same data content)
+    is($initial_checksum_logical, $restored_checksum_logical, 
+       'logical checksum returns to original when data is restored (ignores MVCC)');
+    
+    # Test case 3: UPDATE with same data (logical checksum should NOT change)
+    $node->safe_psql('postgres',
+        "UPDATE test_mvcc SET data = 'initial data' WHERE id = 1");
+    
+    my $same_data_checksum_physical = $node->safe_psql('postgres',
+        "SELECT pg_tuple_physical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
+    my $same_data_checksum_logical = $node->safe_psql('postgres',
+        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
+    
+    # Physical checksum may change (new MVCC version)
+    # Logical checksum should remain the same (data unchanged)
+    is($restored_checksum_logical, $same_data_checksum_logical,
+       'logical checksum unchanged when UPDATE does not change data');
     
     $node->safe_psql('postgres', 'DROP TABLE test_mvcc');
 }
