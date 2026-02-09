@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
 # TAP tests for checksum functionality at all granularities
-# Tests: tuple, column, table, index, and database checksums (physical and logical)
+# Tests: tuple, cell, table, index, and database checksums (physical and logical)
 
 use strict;
 use warnings FATAL => 'all';
@@ -80,37 +80,37 @@ sub test_tuple_checksum_basic {
     $node->safe_psql('postgres', 'DROP TABLE test_tuple');
 }
 
-# Test 2: Column checksum functionality
-sub test_column_checksum_basic {
+# Test 2: Cell checksum functionality
+sub test_cell_checksum_basic {
     my $node = shift;
     
     $node->safe_psql('postgres',
-        'CREATE TABLE test_column (id int, name text, value float, nullable int)');
+        'CREATE TABLE test_cell (id int, name text, value float, nullable int)');
     
     $node->safe_psql('postgres',
-        "INSERT INTO test_column VALUES (1, 'Alice', 100.5, NULL), (2, 'Bob', 200.75, 42)");
+        "INSERT INTO test_cell VALUES (1, 'Alice', 100.5, NULL), (2, 'Bob', 200.75, 42)");
     
-    # Test non-NULL columns
+    # Test non-NULL cells
     my $result1 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_column'::regclass, ctid, 1) FROM test_column WHERE id = 1");
+        "SELECT pg_cell_checksum('test_cell'::regclass, ctid, 1) FROM test_cell WHERE id = 1");
     my $result2 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_column'::regclass, ctid, 2) FROM test_column WHERE id = 1");
+        "SELECT pg_cell_checksum('test_cell'::regclass, ctid, 2) FROM test_cell WHERE id = 1");
     
-    ok(checksum_is_valid($result1), 'non-NULL column 1 checksum valid');
-    ok(checksum_is_valid($result2), 'non-NULL column 2 checksum valid');
-    isnt($result1, $result2, 'different columns have different checksums');
+    ok(checksum_is_valid($result1), 'non-NULL cell 1 checksum valid');
+    ok(checksum_is_valid($result2), 'non-NULL cell 2 checksum valid');
+    isnt($result1, $result2, 'different cells have different checksums');
     
-    # Test NULL column returns -1
+    # Test NULL cell returns -1
     my $null_checksum = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_column'::regclass, ctid, 4) FROM test_column WHERE id = 1");
-    is($null_checksum, -1, 'NULL column returns CHECKSUM_NULL (-1)');
+        "SELECT pg_cell_checksum('test_cell'::regclass, ctid, 4) FROM test_cell WHERE id = 1");
+    is($null_checksum, -1, 'NULL cell returns CHECKSUM_NULL (-1)');
     
-    # Test non-NULL column doesn't return -1
+    # Test non-NULL cell doesn't return -1
     my $non_null_checksum = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_column'::regclass, ctid, 4) FROM test_column WHERE id = 2");
-    ok($non_null_checksum != -1, 'non-NULL column does not return CHECKSUM_NULL');
+        "SELECT pg_cell_checksum('test_cell'::regclass, ctid, 4) FROM test_cell WHERE id = 2");
+    ok($non_null_checksum != -1, 'non-NULL cell does not return CHECKSUM_NULL');
     
-    $node->safe_psql('postgres', 'DROP TABLE test_column');
+    $node->safe_psql('postgres', 'DROP TABLE test_cell');
 }
 
 # Test 3: Table checksum functionality (physical and logical)
@@ -307,9 +307,9 @@ sub test_checksum_detects_corruption {
     my $orig_tuple_logical = $node->safe_psql('postgres',
         "SELECT pg_tuple_logical_checksum('test_corrupt'::regclass, ctid, false) FROM test_corrupt");
     my $orig_col1 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_corrupt'::regclass, ctid, 2) FROM test_corrupt");
+        "SELECT pg_cell_checksum('test_corrupt'::regclass, ctid, 2) FROM test_corrupt");
     my $orig_col2 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_corrupt'::regclass, ctid, 3) FROM test_corrupt");
+        "SELECT pg_cell_checksum('test_corrupt'::regclass, ctid, 3) FROM test_corrupt");
     
     # Simulate corruption by modifying data
     $node->safe_psql('postgres',
@@ -321,17 +321,17 @@ sub test_checksum_detects_corruption {
     my $new_tuple_logical = $node->safe_psql('postgres',
         "SELECT pg_tuple_logical_checksum('test_corrupt'::regclass, ctid, false) FROM test_corrupt");
     my $new_col1 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_corrupt'::regclass, ctid, 2) FROM test_corrupt");
+        "SELECT pg_cell_checksum('test_corrupt'::regclass, ctid, 2) FROM test_corrupt");
     my $new_col2 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_corrupt'::regclass, ctid, 3) FROM test_corrupt");
+        "SELECT pg_cell_checksum('test_corrupt'::regclass, ctid, 3) FROM test_corrupt");
     
     # Tuple checksums should change
     isnt($orig_tuple_physical, $new_tuple_physical, 'tuple physical checksum detects data modification');
     isnt($orig_tuple_logical, $new_tuple_logical, 'tuple logical checksum detects data modification');
     
-    # Column checksums: unchanged column should be same, modified column should differ
-    is($orig_col1, $new_col1, 'unmodified column checksum remains same');
-    isnt($orig_col2, $new_col2, 'modified column checksum changes');
+    # Cell checksums: unchanged cell should be same, modified cell should differ
+    is($orig_col1, $new_col1, 'unmodified cell checksum remains same');
+    isnt($orig_col2, $new_col2, 'modified cell checksum changes');
     
     $node->safe_psql('postgres', 'DROP TABLE test_corrupt');
 }
@@ -357,13 +357,13 @@ sub test_identical_data_different_location {
     
     isnt($checksum1, $checksum2, 'identical data at different ctid has different physical checksums');
     
-    # Column checksums should be identical
+    # Cell checksums should be identical
     my $col_checksum1 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_identical'::regclass, ctid, 2) FROM test_identical WHERE id = 1");
+        "SELECT pg_cell_checksum('test_identical'::regclass, ctid, 2) FROM test_identical WHERE id = 1");
     my $col_checksum2 = $node->safe_psql('postgres',
-        "SELECT pg_column_checksum('test_identical'::regclass, ctid, 2) FROM test_identical WHERE id = 2");
+        "SELECT pg_cell_checksum('test_identical'::regclass, ctid, 2) FROM test_identical WHERE id = 2");
     
-    is($col_checksum1, $col_checksum2, 'identical column data has identical checksums');
+    is($col_checksum1, $col_checksum2, 'identical cell data has identical checksums');
     
     $node->safe_psql('postgres', 'DROP TABLE test_identical');
 }
@@ -470,7 +470,7 @@ sub test_various_data_types {
     # Test checksums for each column type
     for my $col (1..9) {
         my $checksum = $node->safe_psql('postgres',
-            "SELECT pg_column_checksum('test_types'::regclass, ctid, $col) FROM test_types");
+            "SELECT pg_cell_checksum('test_types'::regclass, ctid, $col) FROM test_types");
         
         ok(checksum_is_valid($checksum), "checksum valid for column $col (various types)");
     }
@@ -529,7 +529,7 @@ sub test_page_checksum {
 
 # Run all tests
 test_tuple_checksum_basic($node);
-test_column_checksum_basic($node);
+test_cell_checksum_basic($node);
 test_table_checksum_basic($node);
 test_index_checksum_basic($node);
 test_database_checksum_basic($node);

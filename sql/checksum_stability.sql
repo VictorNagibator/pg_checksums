@@ -135,13 +135,13 @@ SELECT
         AS physical_checksum_changed
 FROM before_reindex b;
 
--- Phase 5: Test column checksums
+-- Phase 5: Test cell checksums
 SELECT 
-    'Column checksums test' as test_phase,
-    COUNT(DISTINCT pg_column_checksum('test_checksum_stability'::regclass, ctid, 1)) = 100
+    'Cell checksums test' as test_phase,
+    COUNT(DISTINCT pg_cell_checksum('test_checksum_stability'::regclass, ctid, 1)) = 100
         AS pk_column_checksums_unique,
     COUNT(CASE WHEN active IS NULL AND 
-        pg_column_checksum('test_checksum_stability'::regclass, ctid, 5) = -1 
+        pg_cell_checksum('test_checksum_stability'::regclass, ctid, 5) = -1 
         THEN 1 END) = COUNT(*) FILTER (WHERE active IS NULL)
         AS null_column_checksums_correct
 FROM test_checksum_stability;

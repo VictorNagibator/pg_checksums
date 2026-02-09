@@ -58,26 +58,26 @@ FROM (
 ) t
 WHERE without_header != with_header;
 
--- Test E: Column checksums for non-NULL columns should not be -1
+-- Test E: Cell checksums for non-NULL cells should not be -1
 SELECT 
-    COUNT(*) = 10 AS non_null_columns_valid
+    COUNT(*) = 10 AS non_null_cells_valid
 FROM (
-    SELECT pg_column_checksum('test_basic'::regclass, ctid, 1) AS checksum
+    SELECT pg_cell_checksum('test_basic'::regclass, ctid, 1) AS checksum
     FROM test_basic
     UNION ALL
-    SELECT pg_column_checksum('test_basic'::regclass, ctid, 2) AS checksum
+    SELECT pg_cell_checksum('test_basic'::regclass, ctid, 2) AS checksum
     FROM test_basic
 ) t
 WHERE checksum != -1;
 
--- Test F: NULL columns should return -1
+-- Test F: NULL cells should return -1
 SELECT 
-    COUNT(*) = 2 AS null_columns_return_neg_one
+    COUNT(*) = 2 AS null_cells_return_neg_one
 FROM (
-    SELECT pg_column_checksum('test_basic'::regclass, ctid, 3) AS checksum
+    SELECT pg_cell_checksum('test_basic'::regclass, ctid, 3) AS checksum
     FROM test_basic WHERE value IS NULL
     UNION ALL
-    SELECT pg_column_checksum('test_basic'::regclass, ctid, 4) AS checksum
+    SELECT pg_cell_checksum('test_basic'::regclass, ctid, 4) AS checksum
     FROM test_basic WHERE data IS NULL
 ) t
 WHERE checksum = -1;
@@ -210,9 +210,9 @@ BEGIN
 END;
 $$;
 
--- Test M: All column checksums for name must be different
+-- Test M: All cell checksums for name must be different
 SELECT 
-    COUNT(DISTINCT pg_column_checksum('test_basic'::regclass, ctid, 2)) = 4 
+    COUNT(DISTINCT pg_cell_checksum('test_basic'::regclass, ctid, 2)) = 4 
     AS all_name_checksums_unique
 FROM test_basic;
 

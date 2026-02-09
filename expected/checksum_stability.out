@@ -152,19 +152,19 @@ FROM before_reindex b;
  After REINDEX | t                          | t
 (1 row)
 
--- Phase 5: Test column checksums
+-- Phase 5: Test cell checksums
 SELECT 
-    'Column checksums test' as test_phase,
-    COUNT(DISTINCT pg_column_checksum('test_checksum_stability'::regclass, ctid, 1)) = 100
+    'Cell checksums test' as test_phase,
+    COUNT(DISTINCT pg_cell_checksum('test_checksum_stability'::regclass, ctid, 1)) = 100
         AS pk_column_checksums_unique,
     COUNT(CASE WHEN active IS NULL AND 
-        pg_column_checksum('test_checksum_stability'::regclass, ctid, 5) = -1 
+        pg_cell_checksum('test_checksum_stability'::regclass, ctid, 5) = -1 
         THEN 1 END) = COUNT(*) FILTER (WHERE active IS NULL)
         AS null_column_checksums_correct
 FROM test_checksum_stability;
-      test_phase       | pk_column_checksums_unique | null_column_checksums_correct 
------------------------+----------------------------+-------------------------------
- Column checksums test | t                          | t
+     test_phase      | pk_column_checksums_unique | null_column_checksums_correct 
+---------------------+----------------------------+-------------------------------
+ Cell checksums test | t                          | t
 (1 row)
 
 -- Final summary

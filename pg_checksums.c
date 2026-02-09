@@ -11,8 +11,8 @@
  *    - Uses PostgreSQL's page checksum algorithm
  *    - Detects physical page corruption
  *
- * 2. COLUMN LEVEL (pg_column_checksum):
- *    - Logical only (depends only on column value and attribute number)
+ * 2. CELL LEVEL (pg_cell_checksum):
+ *    - Logical only (depends only on cell value and attribute number)
  *    - NULL values return CHECKSUM_NULL (0xFFFFFFFF)
  *    - Handles all PostgreSQL data types
  *    - Same value in same column -> same checksum
@@ -135,7 +135,7 @@ static bool index_supports_checksum(Oid amoid);
 static uint32 compute_generic_index_physical_checksum(Relation idxRel);
 static uint32 compute_brin_index_physical_checksum(Relation idxRel);
 static uint32 compute_index_logical_checksum_internal(Relation idxRel);
-static uint32 pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
+static uint32 pg_cell_checksum_internal(Datum value, bool isnull, Oid typid,
                                           int32 typmod, int attnum);
 static uint32 compute_order_independent_checksum(List *hash_list);
 static uint64 compute_database_checksum_internal(bool physical, bool include_system, bool include_toast);
@@ -481,14 +481,14 @@ compute_typlen_byval_checksum(Datum value, Oid typid, int len, int attnum)
 }
 
 /*-------------------------------------------------------------------------
- * COLUMN LEVEL FUNCTIONS (Logical only)
+ * CELL LEVEL FUNCTIONS (Logical only)
  *-------------------------------------------------------------------------
  */
 
 /*
- * pg_column_checksum_internal - Core column checksum calculation
+ * pg_cell_checksum_internal - Core cell checksum calculation
  *
- * This is the central function for computing column-level checksums.
+ * This is the central function for computing cell-level checksums.
  * It handles all PostgreSQL data types, including NULL values.
  *
  * Key design decisions:
@@ -505,7 +505,7 @@ compute_typlen_byval_checksum(Datum value, Oid typid, int len, int attnum)
  * 4. Fixed-length pass-by-reference (other positive typlen)
  */
 static uint32
-pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
+pg_cell_checksum_internal(Datum value, bool isnull, Oid typid,
                             int32 typmod, int attnum)
 {
     Form_pg_type typeForm;
@@ -592,10 +592,10 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
 }
 
 /*
- * pg_column_checksum - SQL function for column-level checksums
+ * pg_cell_checksum - SQL function for cell-level checksums
  *
  * Public SQL-callable function that computes checksum for a specific
- * column of a specific tuple identified by its TID (tuple identifier).
+ * cell of a specific tuple identified by its TID (tuple identifier).
  *
  * Parameters:
  *   relname: OID of the relation (table)
@@ -605,10 +605,10 @@ pg_column_checksum_internal(Datum value, bool isnull, Oid typid,
  * Returns: 32-bit checksum, or NULL if the tuple doesn't exist or
  *          attnum is out of range
  */
-PG_FUNCTION_INFO_V1(pg_column_checksum);
+PG_FUNCTION_INFO_V1(pg_cell_checksum);
 
 Datum
-pg_column_checksum(PG_FUNCTION_ARGS)
+pg_cell_checksum(PG_FUNCTION_ARGS)
 {
     Oid         reloid;
     ItemPointer tid;
@@ -673,8 +673,8 @@ pg_column_checksum(PG_FUNCTION_ARGS)
     attr = TupleDescAttr(tupdesc, attnum_arg - 1);
     value = heap_getattr(&heapTuple, attnum_arg, tupdesc, &isnull);
     
-    /* Compute column checksum using the internal function */
-    checksum = pg_column_checksum_internal(value, isnull, 
+    /* Compute cell checksum using the internal function */
+    checksum = pg_cell_checksum_internal(value, isnull, 
                                           attr->atttypid, 
                                           attr->atttypmod,
                                           attnum_arg);
@@ -974,7 +974,7 @@ pg_tuple_logical_checksum_internal(Relation rel, HeapTuple tuple, bool include_h
             return 0;
         }
         
-        col_hash = pg_column_checksum_internal(value, false,
+        col_hash = pg_cell_checksum_internal(value, false,
                                               attr->atttypid,
                                               attr->atttypmod,
                                               attnum);
@@ -1006,7 +1006,7 @@ pg_tuple_logical_checksum_internal(Relation rel, HeapTuple tuple, bool include_h
         
         value = heap_getattr(tuple, i, tupdesc, &isnull);
         
-        col_hash = pg_column_checksum_internal(value, isnull,
+        col_hash = pg_cell_checksum_internal(value, isnull,
                                               attr->atttypid,
                                               attr->atttypmod,
                                               i);
@@ -1646,7 +1646,7 @@ compute_index_logical_checksum_internal(Relation idxRel)
                         else
                         {
                             Form_pg_attribute attr = TupleDescAttr(idx_tupdesc, i);
-                            uint32 col_hash = pg_column_checksum_internal(values[i], false,
+                            uint32 col_hash = pg_cell_checksum_internal(values[i], false,
                                                                          attr->atttypid,
                                                                          attr->atttypmod,
                                                                          i + 1);

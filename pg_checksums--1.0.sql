@@ -8,7 +8,7 @@
  * with both physical and logical variants (except where noted):
  *
  * 1. PAGE LEVEL: Physical only - detects storage corruption
- * 2. COLUMN LEVEL: Logical only - based on column values
+ * 2. CELL LEVEL: Logical only - based on cell values
  * 3. TUPLE LEVEL: Physical & Logical - row-level integrity
  * 4. TABLE LEVEL: Physical & Logical - table-wide consistency
  * 5. INDEX LEVEL: Physical & Logical - index structure validation
@@ -45,18 +45,18 @@ COMMENT ON FUNCTION pg_page_checksum(regclass, integer) IS
  Returns 0 for new (uninitialized) pages. Detects physical storage corruption.';
 
 /*-----------------------------------------------------------
- * COLUMN LEVEL FUNCTIONS (Logical only)
+ * CELL LEVEL FUNCTIONS (Logical only)
  *-----------------------------------------------------------
  */
 
--- Column-level checksum (logical - depends on column value only)
-CREATE OR REPLACE FUNCTION pg_column_checksum(relname regclass, tid tid, attnum integer)
+-- Cell-level checksum (logical - depends on Cell value only)
+CREATE OR REPLACE FUNCTION pg_cell_checksum(relname regclass, tid tid, attnum integer)
 RETURNS integer
-AS 'MODULE_PATHNAME', 'pg_column_checksum'
+AS 'MODULE_PATHNAME', 'pg_cell_checksum'
 LANGUAGE C STRICT;
 
-COMMENT ON FUNCTION pg_column_checksum(regclass, tid, integer) IS 
-'Logical checksum of a column value. Returns CHECKSUM_NULL (4294967295) for NULL values.
+COMMENT ON FUNCTION pg_cell_checksum(regclass, tid, integer) IS 
+'Logical checksum of a cell value. Returns CHECKSUM_NULL (4294967295) for NULL values.
  Same value in same column always produces same checksum. Independent of physical storage.';
 
 /*-----------------------------------------------------------
