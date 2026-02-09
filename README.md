@@ -2,7 +2,7 @@
 
 ## Overview
 
-`pg_checksums` is a PostgreSQL extension that provides comprehensive checksum functionality at six granularity levels, with both physical and logical variants (except for column level). It enables data integrity verification, change detection, consistency checking, and corruption detection across the entire database hierarchy.
+`pg_checksums` is a PostgreSQL extension that provides comprehensive checksum functionality at six granularity levels, with both physical and logical variants (except for cell level). It enables data integrity verification, change detection, consistency checking, and corruption detection across the entire database hierarchy.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### Multi-Granularity & Dual-Mode Support
 
-* **Six Granularity Levels**: Page, Column, Tuple, Table, Index, and Database
+* **Six Granularity Levels**: Page, Cell, Tuple, Table, Index, and Database
 * **Dual Checksum Types**: Physical (storage-dependent) and Logical (content-dependent)
 * **Type-Aware**: Full support for all PostgreSQL data types
 * **NULL-Aware**: Special `CHECKSUM_NULL` constant for NULL values
@@ -30,7 +30,7 @@
 
 ### Logical Checksums
 
-* **Depend on**: Only logical data content (column values, primary keys)
+* **Depend on**: Only logical data content (cell values, primary keys)
 * **Stable across**: Physical reorganization, `VACUUM FULL`, `CLUSTER`, `REINDEX`
 * **Useful for**: Logical consistency, replication validation, migration verification
 * **Requires**: Primary keys for tuple/table/database logical checksums
@@ -78,18 +78,18 @@ Computes PostgreSQL's built-in page checksum for physical page corruption detect
 SELECT pg_page_checksum('my_table'::regclass, 5);
 ```
 
-### Column Level Functions (Logical Only)
+### Cell Level Functions (Logical Only)
 
-**`pg_column_checksum(regclass, tid, integer) -> integer`**
+**`pg_cell_checksum(regclass, tid, integer) -> integer`**
 
-Computes logical checksum of a column (cell) value. NULL values return `CHECKSUM_NULL` (-1).
+Computes logical checksum of a cell value. NULL values return `CHECKSUM_NULL` (-1).
 
 ```sql
--- Get checksum for column 3 of a specific tuple
-SELECT pg_column_checksum('employees'::regclass, '(5,2)'::tid, 3);
+-- Get checksum for cell (column) 3 of a specific tuple
+SELECT pg_cell_checksum('employees'::regclass, '(5,2)'::tid, 3);
 ```
 
-**Note**: Column checksums are computed for individual values within specific rows, not for entire columns. To compute checksums for all values in a column, you would need to aggregate individual checksums.
+**Note**: Cell checksums are computed for individual values within specific rows, not for entire columns. To compute checksums for all values in a column, you would need to aggregate individual checksums.
 
 ### Tuple Level Functions
 
@@ -386,7 +386,7 @@ WHERE backup_time = '2024-01-15 03:00:00';
 
 | Function                 |       Complexity | Notes                           |
 | ------------------------ | ---------------: | ------------------------------- |
-| `pg_column_checksum`     |             O(1) | Single column, minimal overhead |
+| `pg_cell_checksum`     |             O(1) | Single cell, minimal overhead |
 | `pg_tuple_*_checksum`    |    O(tuple size) | Requires buffer lock            |
 | `pg_table_*_checksum`    |   O(N) full scan | Order-independent aggregation   |
 | `pg_index_*_checksum`    |    O(index size) | Bulk read strategy              |
@@ -394,7 +394,7 @@ WHERE backup_time = '2024-01-15 03:00:00';
 
 ### Memory Usage
 
-* **Column/Tuple level:** Constant (minimal)
+* **Cell/Tuple level:** Constant (minimal)
 * **Table level:** O(N) for checksum collection, but streaming aggregation
 * **Index level:** O(index entries) for logical checksums
 * **Database level:** Streaming aggregation across relations
