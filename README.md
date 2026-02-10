@@ -109,7 +109,7 @@ FROM orders WHERE order_id = 123;
 
 **`pg_tuple_logical_checksum(regclass, tid, boolean) -> integer`**
 
-Computes logical tuple checksum based on primary key values. Returns NULL if no PK.
+Computes logical tuple checksum based on primary key values and data content. Returns NULL if no PK.
 
 ```sql
 -- Logical checksum (requires primary key)
@@ -197,7 +197,7 @@ SELECT pg_data_checksum(E'\x01020304'::bytea, 0);
 
 **`pg_text_checksum(text, integer) -> integer`**
 
-Convenience wrapper for text data checksum.
+Wrapper for text data checksum.
 
 ```sql
 SELECT pg_text_checksum('sample text', 0);
@@ -391,13 +391,6 @@ WHERE backup_time = '2024-01-15 03:00:00';
 | `pg_table_*_checksum`    |   O(N) full scan | Order-independent aggregation   |
 | `pg_index_*_checksum`    |    O(index size) | Bulk read strategy              |
 | `pg_database_*_checksum` | O(total DB size) | Periodic interrupt checks       |
-
-### Memory Usage
-
-* **Cell/Tuple level:** Constant (minimal)
-* **Table level:** O(N) for checksum collection, but streaming aggregation
-* **Index level:** O(index entries) for logical checksums
-* **Database level:** Streaming aggregation across relations
 
 ---
 
