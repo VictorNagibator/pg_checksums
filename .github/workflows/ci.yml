@@ -12,7 +12,7 @@ jobs:
 
     strategy:
       matrix:
-        pg_version: [18]
+        pg_version: [18] 
 
     steps:
       - name: Checkout repository
@@ -25,7 +25,7 @@ jobs:
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
-          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }} build-essential
+          sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} build-essential
 
       - name: Build extension
         run: |
@@ -37,6 +37,7 @@ jobs:
 
       - name: Setup test cluster
         run: |
+          # Создаём временный кластер для тестов, чтобы не мешать системному
           sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start
           sudo -u postgres psql -c "CREATE EXTENSION pg_checksums;" postgres
 
