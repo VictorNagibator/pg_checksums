@@ -37,13 +37,17 @@ jobs:
 
       - name: Setup test cluster
         run: |
-          # Создаём временный кластер для тестов, чтобы не мешать системному
           sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start
-          sudo -u postgres psql -c "CREATE EXTENSION pg_checksums;" postgres
+          # Разрешаем локальные подключения без пароля (trust)
+          echo "local all all trust" | sudo tee -a /etc/postgresql/${{ matrix.pg_version }}/testcluster/pg_hba.conf
+          sudo pg_ctlcluster ${{ matrix.pg_version }} testcluster reload
+          sudo -u postgres psql -p 5433 -c "CREATE EXTENSION pg_checksums;" postgres
 
       - name: Run regression tests
         run: |
           make USE_PGXS=1 installcheck
+        env:
+          PGPORT: 5433
 
       - name: Cleanup cluster
         if: always()
