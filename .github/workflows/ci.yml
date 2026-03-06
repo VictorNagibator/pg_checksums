@@ -18,14 +18,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install PostgreSQL and build dependencies
+      - name: Install PostgreSQL, build dependencies, and Perl modules
         run: |
           sudo apt-get update
           sudo apt-get install -y wget ca-certificates lsb-release
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
-          sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} build-essential
+          sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} build-essential libipc-run-perl
 
       - name: Build extension
         run: |
@@ -53,7 +53,11 @@ jobs:
       - name: Show regression.diffs on failure
         if: failure()
         run: |
-          cat /home/runner/work/pg_checksums/pg_checksums/regression.diffs
+          if [ -f /home/runner/work/pg_checksums/pg_checksums/regression.diffs ]; then
+            cat /home/runner/work/pg_checksums/pg_checksums/regression.diffs
+          else
+            echo "regression.diffs not found"
+          fi
 
       - name: Cleanup cluster
         if: always()
