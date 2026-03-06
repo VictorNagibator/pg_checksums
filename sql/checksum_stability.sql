@@ -13,13 +13,13 @@ CREATE TABLE test_checksum_stability (
     padding char(300) DEFAULT 'x'
 );
 
--- Insert data in RANDOM order to ensure CLUSTER will reorder
+-- Insert data in deterministic random order to ensure CLUSTER will reorder
 SELECT setseed(0.5);
 INSERT INTO test_checksum_stability (id, name, value, category, data)
 SELECT 
     gs,
     'user_' || gs,
-    (random() * 10000)::integer,  -- Random values to ensure unsorted order
+    (gs * 17 + 31) % 10000,
     CASE (gs % 5) 
         WHEN 0 THEN 'A' 
         WHEN 1 THEN 'B' 
@@ -28,7 +28,8 @@ SELECT
         ELSE 'E' 
     END,
     jsonb_build_object('id', gs, 'value', gs * 100)
-FROM generate_series(1, 100) gs;
+FROM generate_series(1, 100) gs
+ORDER BY random();
 
 -- Create indexes for testing
 CREATE INDEX idx_test_stability_value ON test_checksum_stability (value);
@@ -78,7 +79,7 @@ FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;
 
 -- Phase 3: CLUSTER - should reorder table by value ASC
--- Verify table is NOT sorted by value before CLUSTER
+-- Verify table is NOT sorted by value before CLUSTER (using all rows)
 SELECT 
     'Before CLUSTER' as test_phase,
     COUNT(*) > 0 AS has_unsorted_pairs
@@ -86,7 +87,6 @@ FROM (
     SELECT value, ctid,
            lag(value) OVER (ORDER BY ctid) as prev_value
     FROM test_checksum_stability
-    LIMIT 10
 ) t
 WHERE prev_value IS NOT NULL AND value < prev_value;
 
@@ -118,7 +118,10 @@ FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;
 
 -- Phase 4: REINDEX - rebuild indexes
--- Store index checksums before REINDEX
+-- First, bring index up to date after VACUUM FULL and CLUSTER
+REINDEX INDEX idx_test_stability_value;
+
+-- Store index checksums before second REINDEX
 CREATE TEMP TABLE before_reindex AS
 SELECT 
     'idx_test_stability_value' as index_name,
