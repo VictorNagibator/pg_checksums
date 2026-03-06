@@ -12,7 +12,7 @@ jobs:
 
     strategy:
       matrix:
-        pg_version: [18] 
+        pg_version: [18]
 
     steps:
       - name: Checkout repository
@@ -38,10 +38,9 @@ jobs:
       - name: Setup test cluster
         run: |
           sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start
-          # Разрешаем все локальные подключения без пароля (trust)
           echo "local all all trust" | sudo tee -a /etc/postgresql/${{ matrix.pg_version }}/testcluster/pg_hba.conf
+          sudo -u postgres psql -p 5433 -c "ALTER SYSTEM SET autovacuum = off;"
           sudo pg_ctlcluster ${{ matrix.pg_version }} testcluster reload
-          # Создаём роль runner (текущий пользователь CI) с правами суперпользователя
           sudo -u postgres psql -p 5433 -c "CREATE USER runner WITH SUPERUSER;"
           sudo -u postgres psql -p 5433 -c "CREATE EXTENSION pg_checksums;" postgres
 
@@ -50,6 +49,11 @@ jobs:
           make USE_PGXS=1 installcheck
         env:
           PGPORT: 5433
+
+      - name: Show regression.diffs on failure
+        if: failure()
+        run: |
+          cat /home/runner/work/pg_checksums/pg_checksums/regression.diffs
 
       - name: Cleanup cluster
         if: always()
