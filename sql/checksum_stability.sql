@@ -118,16 +118,20 @@ FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;
 
 -- Phase 4: REINDEX - rebuild indexes
--- Store index checksums after CLUSTER (index is already up-to-date)
+-- After CLUSTER, perform a first REINDEX to bring the index to a stable state
+REINDEX INDEX idx_test_stability_value;
+
+-- Store index checksums after the first REINDEX
 CREATE TEMP TABLE before_reindex AS
 SELECT 
     'idx_test_stability_value' as index_name,
     pg_index_logical_checksum('idx_test_stability_value'::regclass) as logical_before,
     pg_index_physical_checksum('idx_test_stability_value'::regclass) as physical_before;
 
+-- Second REINDEX (REINDEX TABLE rebuilds all indexes)
 REINDEX TABLE test_checksum_stability;
 
--- Check index checksum properties
+-- Verify that the logical checksum remains unchanged and the physical one changes
 SELECT 
     'After REINDEX' as test_phase,
     b.logical_before = pg_index_logical_checksum(b.index_name::regclass) 
