@@ -59,6 +59,11 @@ jobs:
             echo "regression.diffs not found"
           fi
 
+      - name: Show TAP test log on failure
+        if: failure()
+        run: |
+          cat /home/runner/work/pg_checksums/pg_checksums/tmp_check/log/regress_log_*
+
       - name: Cleanup cluster
         if: always()
         run: |
