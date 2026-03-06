@@ -411,3 +411,29 @@ make USE_PGXS=1 installcheck
 4. MVCC behavior and concurrency
 5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
 6. Error conditions and edge cases
+
+
+## Automated Testing with `run_tests.sh`
+
+To streamline the development workflow, the extension includes a helper script `run_tests.sh` that automates the complete build–install–test cycle. The script performs the following steps:
+
+- Cleans previous builds (`make clean`)
+- Builds the extension with parallel jobs (`make -j4`)
+- Installs it into the target PostgreSQL installation (using the provided `pg_config`)
+- Starts the PostgreSQL server (if not already running)
+- Runs the regression and TAP tests (`make installcheck`)
+- Stops the server automatically, even if tests fail
+
+```bash
+# Run it from the extension’s root directory
+./run_tests.sh
+```
+### Customization
+
+The script uses the same environment settings as your manual commands. You can adjust the following variables inside the script to match your environment:
+
+* `PG_CONFIG` – path to `pg_config` of the target PostgreSQL installation
+
+* `PGCTL` – path to `pg_ctl`
+
+* `PGDATA` – data directory of the test cluster
