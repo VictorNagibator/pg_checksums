@@ -118,10 +118,7 @@ FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;
 
 -- Phase 4: REINDEX - rebuild indexes
--- First, bring index up to date after VACUUM FULL and CLUSTER
-REINDEX INDEX idx_test_stability_value;
-
--- Store index checksums before second REINDEX
+-- Store index checksums after CLUSTER (index is already up-to-date)
 CREATE TEMP TABLE before_reindex AS
 SELECT 
     'idx_test_stability_value' as index_name,
