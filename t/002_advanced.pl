@@ -396,10 +396,11 @@ sub test_comprehensive_stability {
     
     #-----------------------------------------------------------------
     # Step 2: UPDATE data (logical checksums MUST change)
+    # We update the indexed column 'category' to ensure index changes
     #-----------------------------------------------------------------
-    note("Step 1: Performing UPDATE...");
+    note("Step 1: Performing UPDATE on indexed column category...");
     $node->safe_psql('postgres',
-        "UPDATE test_comprehensive SET data = 'updated_' || id WHERE id <= 100");
+        "UPDATE test_comprehensive SET category = (category + 1) % 10 WHERE id <= 100");
     
     my $after_update_table_logic = $node->safe_psql('postgres',
         "SELECT pg_table_logical_checksum('test_comprehensive'::regclass)");
