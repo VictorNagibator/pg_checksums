@@ -38,9 +38,11 @@ jobs:
       - name: Setup test cluster
         run: |
           sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start
-          # Разрешаем локальные подключения без пароля (trust)
+          # Разрешаем все локальные подключения без пароля (trust)
           echo "local all all trust" | sudo tee -a /etc/postgresql/${{ matrix.pg_version }}/testcluster/pg_hba.conf
           sudo pg_ctlcluster ${{ matrix.pg_version }} testcluster reload
+          # Создаём роль runner (текущий пользователь CI) с правами суперпользователя
+          sudo -u postgres psql -p 5433 -c "CREATE USER runner WITH SUPERUSER;"
           sudo -u postgres psql -p 5433 -c "CREATE EXTENSION pg_checksums;" postgres
 
       - name: Run regression tests
