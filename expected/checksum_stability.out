@@ -12,6 +12,12 @@ CREATE TABLE test_checksum_stability (
     padding char(300) DEFAULT 'x'
 );
 -- Insert data in RANDOM order to ensure CLUSTER will reorder
+SELECT setseed(0.5);
+ setseed 
+---------
+ 
+(1 row)
+
 INSERT INTO test_checksum_stability (id, name, value, category, data)
 SELECT 
     gs,
