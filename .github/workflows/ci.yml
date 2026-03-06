@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        pg_version: [18]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget ca-certificates lsb-release
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }} build-essential
+
+      - name: Build extension
+        run: |
+          make USE_PGXS=1
+
+      - name: Install extension (into system PostgreSQL)
+        run: |
+          sudo make USE_PGXS=1 install
+
+      - name: Setup test cluster
+        run: |
+          sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start
+          sudo -u postgres psql -c "CREATE EXTENSION pg_checksums;" postgres
+
+      - name: Run regression tests
+        run: |
+          make USE_PGXS=1 installcheck
+
+      - name: Cleanup cluster
+        if: always()
+        run: |
+          sudo pg_dropcluster ${{ matrix.pg_version }} testcluster --stop
