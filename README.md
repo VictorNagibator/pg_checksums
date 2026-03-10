@@ -412,6 +412,7 @@ make USE_PGXS=1 installcheck
 5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
 6. Error conditions and edge cases
 
+---
 
 ## Automated Testing with `run_tests.sh`
 
