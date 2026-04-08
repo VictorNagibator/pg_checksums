@@ -388,7 +388,7 @@ WHERE backup_time = '2024-01-15 03:00:00';
 | ------------------------ | ---------------: | ------------------------------- |
 | `pg_cell_checksum`     |             O(1) | Single cell, minimal overhead |
 | `pg_tuple_*_checksum`    |    O(tuple size) | Requires buffer lock            |
-| `pg_table_*_checksum`    |   O(N) full scan | Order-independent aggregation   |
+| `pg_table_*_checksum`    |   O(rows * columns) | Order-independent aggregation   |
 | `pg_index_*_checksum`    |    O(index size) | Bulk read strategy              |
 | `pg_database_*_checksum` | O(total DB size) | Periodic interrupt checks       |
 
