@@ -486,6 +486,96 @@ sub test_comprehensive_stability {
 }
 
 #----------------------------------------------------------------------------
+# Test 5: Parallel checksum consistency
+# Verifies that parallel checksum computation produces the same results as
+# serial computation at the table, index, and database levels.
+#----------------------------------------------------------------------------
+sub test_parallel_consistency {
+    my $node = shift;
+
+    note("Testing parallel checksum consistency");
+
+    $node->safe_psql('postgres',
+        'CREATE TABLE test_parallel (id int PRIMARY KEY, data text, padding char(200) DEFAULT \'x\')');
+    $node->safe_psql('postgres',
+        "INSERT INTO test_parallel SELECT gs, 'data_' || gs FROM generate_series(1, 3000) gs");
+    $node->safe_psql('postgres',
+        'CREATE INDEX idx_test_parallel ON test_parallel (data)');
+
+    # Table physical checksum: serial vs parallel
+    my $serial_table_phys = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 0;
+         SELECT pg_table_physical_checksum('test_parallel'::regclass, false)");
+    my $parallel_table_phys = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_table_physical_checksum('test_parallel'::regclass, false)");
+    is($parallel_table_phys, $serial_table_phys,
+       'parallel table physical checksum matches serial');
+
+    # Table logical checksum: serial vs parallel
+    my $serial_table_logic = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 0;
+         SELECT pg_table_logical_checksum('test_parallel'::regclass)");
+    my $parallel_table_logic = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_table_logical_checksum('test_parallel'::regclass)");
+    is($parallel_table_logic, $serial_table_logic,
+       'parallel table logical checksum matches serial');
+
+    # Index physical checksum: serial vs parallel
+    my $serial_idx_phys = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 0;
+         SELECT pg_index_physical_checksum('idx_test_parallel'::regclass)");
+    my $parallel_idx_phys = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_index_physical_checksum('idx_test_parallel'::regclass)");
+    is($parallel_idx_phys, $serial_idx_phys,
+       'parallel index physical checksum matches serial');
+
+    # Index logical checksum: serial vs parallel
+    my $serial_idx_logic = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 0;
+         SELECT pg_index_logical_checksum('idx_test_parallel'::regclass)");
+    my $parallel_idx_logic = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_index_logical_checksum('idx_test_parallel'::regclass)");
+    is($parallel_idx_logic, $serial_idx_logic,
+       'parallel index logical checksum matches serial');
+
+    # Database physical checksum: serial vs parallel
+    my $serial_db_phys = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 0;
+         SELECT pg_database_physical_checksum(false, false)");
+    my $parallel_db_phys = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_database_physical_checksum(false, false)");
+    is($parallel_db_phys, $serial_db_phys,
+       'parallel database physical checksum matches serial');
+
+    # Database logical checksum: serial vs parallel
+    my $serial_db_logic = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 0;
+         SELECT pg_database_logical_checksum(false, false)");
+    my $parallel_db_logic = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_database_logical_checksum(false, false)");
+    is($parallel_db_logic, $serial_db_logic,
+       'parallel database logical checksum matches serial');
+
+    # Parallel results must be deterministic across repeated runs
+    my $parallel_run1 = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_table_physical_checksum('test_parallel'::regclass, false)");
+    my $parallel_run2 = $node->safe_psql('postgres',
+        "SET pg_checksums.workers = 2;
+         SELECT pg_table_physical_checksum('test_parallel'::regclass, false)");
+    is($parallel_run1, $parallel_run2,
+       'parallel checksum is deterministic across repeated runs');
+
+    $node->safe_psql('postgres', 'DROP TABLE test_parallel CASCADE');
+}
+
+#----------------------------------------------------------------------------
 # Main test execution
 #----------------------------------------------------------------------------
 
@@ -496,6 +586,7 @@ test_vacuum_stability($node);
 test_cluster_stability($node);
 test_reindex_stability($node);
 test_comprehensive_stability($node);
+test_parallel_consistency($node);
 
 note("=================================");
 note("All stability tests completed");

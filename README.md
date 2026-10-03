@@ -16,6 +16,8 @@
 * **NULL-Aware**: Special `CHECKSUM_NULL` constant for NULL values
 * **MVCC-Aware**: Incorporates transaction visibility in physical checksums
 * **Primary Key Aware**: Logical checksums require and use primary keys
+* **Parallel Computation**: Table, index, and database checksums can be computed
+  with PostgreSQL parallel workers for faster scans of large relations
 
 ---
 
@@ -230,11 +232,13 @@ CHECKSUM_NULL = 0xFFFFFFFF (signed -1)
 
 ### Order-Independent Aggregation
 
-For table and database checksums, extension uses order-independent aggregation to ensure consistent results regardless of scan order:
+For table, index, and database checksums, the extension uses an order-independent aggregate so that the result does not depend on scan order:
 
 1. Collect all individual checksums
-2. Sort them (ensures order independence)
-3. Combine using FNV-1a
+2. Fold each through a 32-bit (or 64-bit) avalanche finalizer
+3. Combine them with XOR
+
+XOR is both commutative and associative, which makes the aggregate not only order-independent but also partition-independent. This is what allows a single backend and any number of parallel workers to produce byte-for-byte identical results without extra coordination.
 
 ### Type-Specific Handling
 
@@ -244,6 +248,46 @@ The extension properly handles all PostgreSQL type categories:
 * **Varlena types** (text, bytea): Detoasted and entire structure hashed
 * **C-string types**: Null-terminated string hashed
 * **Pass-by-reference types**: Pointer dereferenced and data hashed
+
+---
+
+## Parallel Computation
+
+Table, index, and database checksums can be computed in parallel using
+PostgreSQL's parallel worker infrastructure. Each worker scans a subset of
+the relation's blocks (or a subset of the database's relations) using a
+shared, self-balancing atomic counter, and the partial results are combined
+by the leader.
+
+### Configuration
+
+The degree of parallelism is controlled by the `pg_checksums.workers` GUC:
+
+| Setting                          | Behavior                                   |
+| -------------------------------- | ------------------------------------------ |
+| `pg_checksums.workers = 0`       | Disabled (default, single-backend)         |
+| `pg_checksums.workers = N`       | Use up to `N` parallel workers             |
+
+The actual number of workers is clamped by `max_parallel_workers` and by the
+number of blocks (or relations) being scanned. Parallelism is also skipped
+when the function is already running inside a parallel worker, since
+parallel workers cannot be nested.
+
+```sql
+-- Compute a table checksum with 4 parallel workers
+SET pg_checksums.workers = 4;
+SELECT pg_table_physical_checksum('large_table'::regclass, false);
+
+-- Disable parallelism (restore the default)
+RESET pg_checksums.workers;
+```
+
+### Correctness
+
+Because aggregation is order- and partition-independent, the parallel result
+is always identical to the serial result for the same data state, regardless
+of the number of workers. The same consistent snapshot is propagated to all
+workers, so every tuple is checksummed as of the same point in time.
 
 ---
 
@@ -392,6 +436,10 @@ WHERE backup_time = '2024-01-15 03:00:00';
 | `pg_index_*_checksum`    |    O(index size) | Bulk read strategy              |
 | `pg_database_*_checksum` | O(total DB size) | Periodic interrupt checks       |
 
+Table, index, and database scans can be parallelized with
+`pg_checksums.workers`; the scan work is divided among the workers with
+linear speedup up to the point where the scan becomes I/O-bound.
+
 ---
 
 ## Test Suite
@@ -411,6 +459,7 @@ make USE_PGXS=1 installcheck
 4. MVCC behavior and concurrency
 5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
 6. Error conditions and edge cases
+7. Parallel vs serial checksum consistency at the table, index, and database levels
 
 
 ## Automated Testing with `run_tests.sh`
