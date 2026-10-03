@@ -45,7 +45,7 @@
 
 ### Prerequisites
 
-* PostgreSQL 18 or later
+* PostgreSQL 14 or later (tested on 14, 15, 16, 17, and 18)
 * C compiler and PostgreSQL development headers
 
 ### Build and Install

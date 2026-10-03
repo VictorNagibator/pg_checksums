@@ -31,6 +31,14 @@
 #include "catalog/pg_operator.h"
 #include "nodes/pg_list.h"
 
+/*
+ * PG_GETARG_ITEMPOINTER was introduced in PostgreSQL 16. Provide a
+ * compatibility macro so the extension builds against older releases.
+ */
+#if PG_VERSION_NUM < 160000
+#define PG_GETARG_ITEMPOINTER(n) ((ItemPointer) DatumGetPointer(PG_GETARG_DATUM(n)))
+#endif
+
 /* FNV-1a 32-bit hash algorithm constants */
 #define FNV_PRIME_32 16777619U
 #define FNV_BASIS_32 2166136261U

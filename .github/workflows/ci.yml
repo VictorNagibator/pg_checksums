@@ -11,8 +11,9 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        pg_version: [18]
+        pg_version: [14, 15, 16, 17, 18]
 
     steps:
       - name: Checkout repository
@@ -21,11 +22,10 @@ jobs:
       - name: Install PostgreSQL, build dependencies, and Perl modules
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget ca-certificates lsb-release
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get install -y ca-certificates postgresql-common build-essential libipc-run-perl
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get update
-          sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} build-essential libipc-run-perl
+          sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
 
       - name: Build extension
         run: |
@@ -37,7 +37,7 @@ jobs:
 
       - name: Setup test cluster
         run: |
-          sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start
+          sudo pg_createcluster ${{ matrix.pg_version }} testcluster --start --port 5433
           echo "local all all trust" | sudo tee -a /etc/postgresql/${{ matrix.pg_version }}/testcluster/pg_hba.conf
           sudo -u postgres psql -p 5433 -c "ALTER SYSTEM SET autovacuum = off;"
           sudo pg_ctlcluster ${{ matrix.pg_version }} testcluster reload

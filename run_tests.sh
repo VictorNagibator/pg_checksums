@@ -8,10 +8,13 @@ PG_CONFIG="$HOME/postgres-custom/bin/pg_config"
 PGCTL="$HOME/postgres-custom/bin/pg_ctl"
 PGDATA="$HOME/pgdata-custom"
 
-# Function to stop the PostgreSQL server (called on exit)
+# Function to stop the PostgreSQL server and clean up build artifacts
+# (called on exit)
 cleanup() {
     echo "Stopping PostgreSQL server..."
     "$PGCTL" stop -D "$PGDATA" -m fast 2>/dev/null || true
+    echo "Cleaning up build artifacts..."
+    make USE_PGXS=1 clean 2>/dev/null || true
 }
 
 # Trap EXIT to ensure cleanup is called on normal or abnormal exit
