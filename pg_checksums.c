@@ -2061,12 +2061,14 @@ scan_index_blocks_logical(Relation idxRel, BlockNumber start, BlockNumber end,
     BlockNumber blkno;
     TupleDesc   idx_tupdesc = RelationGetDescr(idxRel);
     BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
+    bool        is_btree = (idxRel->rd_rel->relam == BTREE_AM_OID);
 
     for (blkno = start; blkno < end; blkno++)
     {
         Buffer      buffer;
         Page        page;
         OffsetNumber maxoff;
+        OffsetNumber firstoff;
 
         buffer = ReadBufferExtended(idxRel, MAIN_FORKNUM, blkno,
                                     RBM_NORMAL, bstrategy);
@@ -2076,9 +2078,34 @@ scan_index_blocks_logical(Relation idxRel, BlockNumber start, BlockNumber end,
 
         if (!PageIsNew(page))
         {
+            firstoff = FirstOffsetNumber;
+
+            /*
+             * For B-tree indexes, skip deleted/half-dead pages and internal
+             * (non-leaf) pages, whose entries are structural pivot tuples
+             * rather than logical (key, TID) pairs. On leaf pages the high
+             * key (also a pivot tuple) is skipped as well, so that the
+             * logical checksum depends only on real index entries and is
+             * therefore stable across REINDEX.
+             */
+            if (is_btree)
+            {
+                BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+                if (P_IGNORE(opaque) || !P_ISLEAF(opaque))
+                {
+                    UnlockReleaseBuffer(buffer);
+                    if ((blkno & 63) == 0)
+                        CHECK_FOR_INTERRUPTS();
+                    continue;
+                }
+
+                firstoff = P_FIRSTDATAKEY(opaque);
+            }
+
             maxoff = PageGetMaxOffsetNumber(page);
 
-            for (OffsetNumber offnum = FirstOffsetNumber;
+            for (OffsetNumber offnum = firstoff;
                  offnum <= maxoff;
                  offnum = OffsetNumberNext(offnum))
             {

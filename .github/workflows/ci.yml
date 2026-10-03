@@ -29,11 +29,11 @@ jobs:
 
       - name: Build extension
         run: |
-          make USE_PGXS=1
+          make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
 
       - name: Install extension (into system PostgreSQL)
         run: |
-          sudo make USE_PGXS=1 install
+          sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config install
 
       - name: Setup test cluster
         run: |
@@ -46,7 +46,7 @@ jobs:
 
       - name: Run regression tests
         run: |
-          make USE_PGXS=1 installcheck
+          make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config installcheck
         env:
           PGPORT: 5433
 
