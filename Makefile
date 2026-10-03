@@ -6,7 +6,7 @@ OBJS = pg_checksums.o
 EXTENSION = pg_checksums
 DATA = pg_checksums--1.0.sql
 
-REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel
+REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition
 REGRESS_OPTS = \
     --inputdir=./ \
     --load-extension=pg_checksums

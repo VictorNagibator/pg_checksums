@@ -97,6 +97,7 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_class.h" 
+#include "catalog/pg_inherits.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/dsm.h"
@@ -1358,6 +1359,43 @@ pg_tuple_logical_checksum(PG_FUNCTION_ARGS)
 }
 
 /*-------------------------------------------------------------------------
+ * Partitioned Table Helpers
+ *-------------------------------------------------------------------------
+ */
+
+/*
+ * pg_checksums_leaf_partitions - return the OIDs of all leaf partitions
+ * of a partitioned table
+ *
+ * Uses find_all_inheritors to collect every descendant of the given
+ * relation and keeps only the leaf partitions (ordinary tables). Foreign
+ * table partitions are skipped because they have no local storage to
+ * checksum. The list is empty for a partitioned table with no partitions.
+ */
+static List *
+pg_checksums_leaf_partitions(Oid reloid)
+{
+    List       *children;
+    List       *leaves = NIL;
+    ListCell   *lc;
+
+    children = find_all_inheritors(reloid, AccessShareLock, NULL);
+
+    foreach(lc, children)
+    {
+        Oid         childoid = lfirst_oid(lc);
+
+        if (childoid == reloid)
+            continue;
+
+        if (get_rel_relkind(childoid) == RELKIND_RELATION)
+            leaves = lappend_oid(leaves, childoid);
+    }
+
+    return leaves;
+}
+
+/*-------------------------------------------------------------------------
  * TABLE LEVEL FUNCTIONS (Physical and Logical)
  *-------------------------------------------------------------------------
  */
@@ -1398,6 +1436,40 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
     
     /* Open relation */
     rel = relation_open(reloid, AccessShareLock);
+
+    /*
+     * A partitioned table has no storage of its own: its data lives in the
+     * leaf partitions. Aggregate the physical checksums of all leaf
+     * partitions into a single order-independent 64-bit value.
+     */
+    if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+    {
+        List       *parts = pg_checksums_leaf_partitions(reloid);
+        ChecksumAccum64 acc64 = {0, 0};
+        ListCell   *lc;
+
+        foreach(lc, parts)
+        {
+            Oid         partoid = lfirst_oid(lc);
+            uint64      part_checksum;
+
+            part_checksum = DatumGetInt64(
+                DirectFunctionCall2(pg_table_physical_checksum,
+                                    ObjectIdGetDatum(partoid),
+                                    BoolGetDatum(include_header)));
+
+            checksum_accum64_add(&acc64,
+                                 combine_checksums_64(part_checksum,
+                                                      (uint64) partoid));
+        }
+
+        relation_close(rel, AccessShareLock);
+
+        final_checksum = checksum_accum64_finalize(&acc64);
+        final_checksum = combine_checksums_64(final_checksum, (uint64) reloid);
+
+        PG_RETURN_INT64((int64) final_checksum);
+    }
     
     /* Include relation metadata in checksum */
     relation_hash = fnv1a_32_hash(&reloid, sizeof(reloid), FNV_BASIS_32);
@@ -1478,6 +1550,58 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
     
     /* Open relation */
     rel = relation_open(reloid, AccessShareLock);
+
+    /*
+     * A partitioned table has no storage of its own. Check the primary key
+     * on the parent (partitions inherit it), then aggregate the logical
+     * checksums of all leaf partitions.
+     */
+    if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+    {
+        List       *parts;
+        ChecksumAccum64 acc64 = {0, 0};
+        ListCell   *lc;
+        bool        any_null = false;
+
+        pk_columns = find_primary_key_columns(reloid);
+        if (pk_columns == NIL)
+        {
+            list_free(pk_columns);
+            relation_close(rel, AccessShareLock);
+            PG_RETURN_NULL();
+        }
+        list_free(pk_columns);
+
+        parts = pg_checksums_leaf_partitions(reloid);
+
+        foreach(lc, parts)
+        {
+            Oid         partoid = lfirst_oid(lc);
+            Datum       d = DirectFunctionCall1(pg_table_logical_checksum,
+                                                ObjectIdGetDatum(partoid));
+
+            if (DatumGetPointer(d) == NULL)
+                any_null = true;
+            else
+            {
+                uint64      part_checksum = DatumGetInt64(d);
+
+                checksum_accum64_add(&acc64,
+                                     combine_checksums_64(part_checksum,
+                                                          (uint64) partoid));
+            }
+        }
+
+        relation_close(rel, AccessShareLock);
+
+        if (any_null)
+            PG_RETURN_NULL();
+
+        final_checksum = checksum_accum64_finalize(&acc64);
+        final_checksum = combine_checksums_64(final_checksum, (uint64) reloid);
+
+        PG_RETURN_INT64((int64) final_checksum);
+    }
     
     /* Check for primary key */
     pk_columns = find_primary_key_columns(reloid);

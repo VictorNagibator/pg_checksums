@@ -18,6 +18,8 @@
 * **Primary Key Aware**: Logical checksums require and use primary keys
 * **Parallel Computation**: Table, index, and database checksums can be computed
   with PostgreSQL parallel workers for faster scans of large relations
+* **Partitioned Table Support**: Table-level checksums transparently handle
+  partitioned tables by aggregating the checksums of all leaf partitions
 
 ---
 
@@ -140,6 +142,20 @@ Aggregates logical tuple checksums for entire table. Requires primary key.
 ```sql
 -- Table logical checksum (requires PK)
 SELECT pg_table_logical_checksum('products'::regclass);
+```
+
+**Partitioned tables**: Both `pg_table_physical_checksum` and
+`pg_table_logical_checksum` accept partitioned tables. Since a partitioned
+table has no storage of its own, the extension recurses into every leaf
+partition and aggregates their checksums into a single order-independent
+value. Logical checksums require the primary key to be defined on the
+partitioned table (partitions inherit it). Nested (multi-level) partitioning
+is supported as well.
+
+```sql
+-- Checksum a partitioned table (recurses into all partitions)
+SELECT pg_table_physical_checksum('sales'::regclass, false);
+SELECT pg_table_logical_checksum('sales'::regclass);
 ```
 
 ### Index Level Functions
@@ -460,6 +476,7 @@ make USE_PGXS=1 installcheck
 5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
 6. Error conditions and edge cases
 7. Parallel vs serial checksum consistency at the table, index, and database levels
+8. Partitioned tables (single- and multi-level, with and without primary keys)
 
 ---
 
