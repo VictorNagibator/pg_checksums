@@ -209,11 +209,20 @@ jobs:
           echo "TAP_PERL_DIR=$TAP_PERL_DIR" >> "$GITHUB_ENV"
           echo "PROVE_BIN=/usr/bin/perl.exe /usr/bin/core_perl/prove" >> "$GITHUB_ENV"
           # MSYS2's Perl is Cygwin-based (osname=cygwin), but it drives a native
-          # Windows PostgreSQL, which cannot use the Cygwin Unix-socket
-          # directory. Force TCP connections for the test cluster.
+          # Windows PostgreSQL. Two adjustments are needed:
+          #  1. native Postgres cannot use the Cygwin Unix-socket directory, so
+          #     force TCP connections for the test clusters;
+          #  2. native psql writes CRLF to pipes and Cygwin Perl does not strip it
+          #     (the test framework only normalizes when it detects Windows), so
+          #     normalize line endings before the usual chomp().
           for f in "$TAP_PERL_DIR/PostgreSQL/Test/Utils.pm" "$TAP_PERL_DIR/TestLib.pm"; do
             if [ -f "$f" ] && grep -q 'use_unix_sockets' "$f"; then
               printf '%s\n' '' "\$use_unix_sockets = 0 if \$Config{osname} eq 'cygwin';" '1;' >> "$f"
+            fi
+          done
+          for f in "$TAP_PERL_DIR/PostgreSQL/Test/Cluster.pm" "$TAP_PERL_DIR/PostgresNode.pm"; do
+            if [ -f "$f" ]; then
+              sed -i 's/chomp \$\$stdout;/$$stdout =~ s\/\\r\\n\/\\n\/g; chomp $$stdout;/g; s/chomp \$\$stderr;/$$stderr =~ s\/\\r\\n\/\\n\/g; chomp $$stderr;/g' "$f"
             fi
           done
 
