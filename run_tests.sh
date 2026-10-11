@@ -7,6 +7,7 @@ set -e  # Exit on any error (except specially handled ones)
 PG_CONFIG="$HOME/postgres-custom/bin/pg_config"
 PGCTL="$HOME/postgres-custom/bin/pg_ctl"
 PGDATA="$HOME/pgdata-custom"
+JOBS=4
 
 # Function to stop the PostgreSQL server and clean up build artifacts
 # (called on exit)
@@ -28,8 +29,8 @@ echo ">>> Cleaning previous build"
 make USE_PGXS=1 clean
 
 # 2. Build
-echo ">>> Building with -j4"
-make USE_PGXS=1 -j4
+echo ">>> Building with -j$JOBS"
+make USE_PGXS=1 -j"$JOBS"
 
 # 3. Install into the target PostgreSQL
 echo ">>> Installing extension"

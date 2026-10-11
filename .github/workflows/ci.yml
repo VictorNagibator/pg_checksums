@@ -6,14 +6,24 @@ on:
   pull_request:
     branches: [ main, master ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  # Linux - full PostgreSQL version matrix (14 - 18) using the PGDG packages.
+  # Regression tests and TAP tests are both executed.
+  linux:
+    name: Linux / PostgreSQL ${{ matrix.pg_version }}
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
         pg_version: [14, 15, 16, 17, 18]
+
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
 
     steps:
       - name: Checkout repository
@@ -28,12 +38,10 @@ jobs:
           sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
 
       - name: Build extension
-        run: |
-          make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
 
       - name: Install extension (into system PostgreSQL)
-        run: |
-          sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config install
+        run: sudo make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
 
       - name: Setup test cluster
         run: |
@@ -42,29 +50,218 @@ jobs:
           sudo -u postgres psql -p 5433 -c "ALTER SYSTEM SET autovacuum = off;"
           sudo pg_ctlcluster ${{ matrix.pg_version }} testcluster reload
           sudo -u postgres psql -p 5433 -c "CREATE USER runner WITH SUPERUSER;"
-          sudo -u postgres psql -p 5433 -c "CREATE EXTENSION pg_checksums;" postgres
 
-      - name: Run regression tests
-        run: |
-          make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config installcheck
+      - name: Run regression tests and TAP tests
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck
         env:
           PGPORT: 5433
 
       - name: Show regression.diffs on failure
         if: failure()
         run: |
-          if [ -f /home/runner/work/pg_checksums/pg_checksums/regression.diffs ]; then
-            cat /home/runner/work/pg_checksums/pg_checksums/regression.diffs
-          else
-            echo "regression.diffs not found"
-          fi
+          if [ -f regression.diffs ]; then cat regression.diffs; else echo "regression.diffs not found"; fi
 
       - name: Show TAP test log on failure
         if: failure()
-        run: |
-          cat /home/runner/work/pg_checksums/pg_checksums/tmp_check/log/regress_log_*
+        run: cat tmp_check/log/regress_log_* 2>/dev/null || true
 
       - name: Cleanup cluster
         if: always()
+        run: sudo pg_dropcluster ${{ matrix.pg_version }} testcluster --stop || true
+
+  # macOS - full PostgreSQL version matrix (14 - 18) using Homebrew bottles.
+  # Homebrew's PostgreSQL is built without --enable-tap-tests, so the TAP Perl
+  # modules are not installed. We download the matching PostgreSQL source's
+  # src/test/perl tree and force the PGXS TAP target on, so that TAP tests run
+  # here as well.
+  macos:
+    name: macOS / PostgreSQL ${{ matrix.pg_version }}
+    runs-on: macos-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [14, 15, 16, 17, 18]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg_version }} and Perl
         run: |
-          sudo pg_dropcluster ${{ matrix.pg_version }} testcluster --stop
+          brew install postgresql@${{ matrix.pg_version }} perl
+          echo "PG_CONFIG=$(brew --prefix postgresql@${{ matrix.pg_version }})/bin/pg_config" >> "$GITHUB_ENV"
+          echo "$(brew --prefix perl)/bin" >> "$GITHUB_PATH"
+
+      - name: Install TAP prerequisites (IPC::Run and PostgreSQL Perl test modules)
+        run: |
+          curl -L -o "$RUNNER_TEMP/ipc-run.tar.gz" \
+            "https://cpan.metacpan.org/authors/id/T/TO/TODDR/IPC-Run-20231003.0.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ipc-run.tar.gz" -C "$RUNNER_TEMP"
+          echo "PERL5LIB=$RUNNER_TEMP/IPC-Run-20231003.0/lib" >> "$GITHUB_ENV"
+          curl -L -o "$RUNNER_TEMP/pg-src.tar.gz" \
+            "https://github.com/postgres/postgres/archive/refs/heads/REL_${{ matrix.pg_version }}_STABLE.tar.gz"
+          tar -xzf "$RUNNER_TEMP/pg-src.tar.gz" -C "$RUNNER_TEMP"
+          echo "TAP_PERL_DIR=$RUNNER_TEMP/postgres-REL_${{ matrix.pg_version }}_STABLE/src/test/perl" >> "$GITHUB_ENV"
+
+      - name: Build extension
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+
+      - name: Install extension
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+
+      - name: Setup test cluster
+        run: |
+          PGBIN="$(dirname "$PG_CONFIG")"
+          PGDATA="$RUNNER_TEMP/pgdata"
+          rm -rf "$PGDATA"
+          "$PGBIN/initdb" -D "$PGDATA" -U postgres -A trust --no-sync
+          "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/server.log" -o "-p 5433" -w start
+          echo "PGDATA=$PGDATA" >> "$GITHUB_ENV"
+
+      - name: Run regression tests and TAP tests
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE=prove PROVE_FLAGS="-I $TAP_PERL_DIR"
+        env:
+          PGPORT: 5433
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+
+      - name: Show regression.diffs on failure
+        if: failure()
+        run: |
+          if [ -f regression.diffs ]; then cat regression.diffs; else echo "regression.diffs not found"; fi
+
+      - name: Show TAP test log on failure
+        if: failure()
+        run: cat tmp_check/log/regress_log_* 2>/dev/null || true
+
+      - name: Show cluster log on failure
+        if: failure()
+        run: cat "$PGDATA/server.log" 2>/dev/null || true
+
+      - name: Stop test cluster
+        if: always()
+        run: |
+          PGBIN="$(dirname "$PG_CONFIG")"
+          "$PGBIN/pg_ctl" -D "$PGDATA" -m immediate stop || true
+
+  # Windows - full PostgreSQL version matrix (14 - 18).
+  # The official PostgreSQL binaries are built with MSVC and do not ship PGXS,
+  # so PostgreSQL is compiled from source with MinGW-w64 inside MSYS2 (the same
+  # way MSYS2 packages PostgreSQL). The build (with --enable-tap-tests) is cached
+  # between runs, so only the first run pays the compilation cost.
+  windows:
+    name: Windows / PostgreSQL ${{ matrix.pg_version }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [14, 15, 16, 17, 18]
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 with MinGW-w64 toolchain and Perl
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            tar
+            curl
+            bison
+            flex
+            diffutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-perl
+
+      - name: Install PostgreSQL TAP prerequisite (IPC::Run)
+        run: |
+          curl -L -o ipc-run.tar.gz \
+            "https://cpan.metacpan.org/authors/id/T/TO/TODDR/IPC-Run-20231003.0.tar.gz"
+          tar -xzf ipc-run.tar.gz
+          cd IPC-Run-20231003.0
+          perl Makefile.PL
+          make
+          make install
+
+      - name: Cache PostgreSQL ${{ matrix.pg_version }} build
+        id: pg-cache
+        uses: actions/cache@v4
+        with:
+          path: pg-${{ matrix.pg_version }}
+          key: ${{ runner.os }}-pg-${{ matrix.pg_version }}-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Build PostgreSQL ${{ matrix.pg_version }} from source
+        if: steps.pg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          PREFIX="$(pwd)/pg-${{ matrix.pg_version }}"
+          curl -L -o pg-src.tar.gz \
+            "https://github.com/postgres/postgres/archive/refs/heads/REL_${{ matrix.pg_version }}_STABLE.tar.gz"
+          tar -xzf pg-src.tar.gz
+          cd "postgres-REL_${{ matrix.pg_version }}_STABLE"
+          ./configure \
+            --prefix="$PREFIX" \
+            --build="$MINGW_CHOST" \
+            --host="$MINGW_CHOST" \
+            --enable-tap-tests \
+            --disable-nls \
+            --without-icu \
+            --without-readline \
+            --without-zlib
+          make -j"$(nproc)"
+          make install
+
+      - name: Set PG_CONFIG
+        run: echo "PG_CONFIG=$(pwd)/pg-${{ matrix.pg_version }}/bin/pg_config" >> "$GITHUB_ENV"
+
+      - name: Show PostgreSQL version
+        run: '"$PG_CONFIG" --version'
+
+      - name: Build extension
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+
+      - name: Install extension
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+
+      - name: Setup test cluster
+        run: |
+          PGBIN="$(pwd)/pg-${{ matrix.pg_version }}/bin"
+          PGDATA="$(pwd)/.pgdata-${{ matrix.pg_version }}"
+          rm -rf "$PGDATA"
+          "$PGBIN/initdb.exe" -D "$PGDATA" -U postgres -A trust --no-sync
+          "$PGBIN/pg_ctl.exe" -D "$PGDATA" -l "$PGDATA/server.log" -o "-p 5433" -w start
+          echo "PGDATA=$PGDATA" >> "$GITHUB_ENV"
+
+      - name: Run regression tests and TAP tests
+        env:
+          PGPORT: 5433
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck
+
+      - name: Show regression.diffs on failure
+        if: failure()
+        run: |
+          if [ -f regression.diffs ]; then cat regression.diffs; else echo "regression.diffs not found"; fi
+
+      - name: Show TAP test log on failure
+        if: failure()
+        run: cat tmp_check/log/regress_log_* 2>/dev/null || true
+
+      - name: Show cluster log on failure
+        if: failure()
+        run: cat "$PGDATA/server.log" 2>/dev/null || true
+
+      - name: Stop test cluster
+        if: always()
+        run: '"$(pwd)/pg-${{ matrix.pg_version }}/bin/pg_ctl.exe" -D "$PGDATA" -m immediate stop || true'

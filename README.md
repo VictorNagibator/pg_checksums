@@ -1,5 +1,7 @@
 # pg_checksums - Multi-Level Data Integrity Extension for PostgreSQL
 
+[![CI](https://github.com/VictorNagibator/pg_checksums/actions/workflows/ci.yml/badge.svg)](https://github.com/VictorNagibator/pg_checksums/actions/workflows/ci.yml)
+
 ## Overview
 
 `pg_checksums` is a PostgreSQL extension that provides comprehensive checksum functionality at six granularity levels, with both physical and logical variants (except for cell level). It enables data integrity verification, change detection, consistency checking, and corruption detection across the entire database hierarchy.
@@ -485,7 +487,7 @@ make USE_PGXS=1 installcheck
 To streamline the development workflow, the extension includes a helper script `run_tests.sh` that automates the complete build–install–test cycle. The script performs the following steps:
 
 - Cleans previous builds (`make clean`)
-- Builds the extension with parallel jobs (`make -j4`)
+- Builds the extension with parallel jobs (`make -j$JOBS`, `JOBS` defaults to 4)
 - Installs it into the target PostgreSQL installation (using the provided `pg_config`)
 - Starts the PostgreSQL server (if not already running)
 - Runs the regression and TAP tests (`make installcheck`)
@@ -504,3 +506,5 @@ The script uses the same environment settings as your manual commands. You can a
 * `PGCTL` – path to `pg_ctl`
 
 * `PGDATA` – data directory of the test cluster
+
+* `JOBS` – number of parallel build jobs (passed to `make -j`)
