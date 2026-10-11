@@ -148,8 +148,10 @@ jobs:
   # Windows - full PostgreSQL version matrix (14 - 18).
   # The official PostgreSQL binaries are built with MSVC and do not ship PGXS,
   # so PostgreSQL is compiled from source with MinGW-w64 inside MSYS2 (the same
-  # way MSYS2 packages PostgreSQL). The build (with --enable-tap-tests) is cached
-  # between runs, so only the first run pays the compilation cost.
+  # way MSYS2 packages PostgreSQL). The resulting install is cached between runs,
+  # so only the first run pays the compilation cost.
+  # TAP tests are driven by the MSYS Perl (osname=msys), which is already
+  # supported by PostgreSQL's test framework.
   windows:
     name: Windows / PostgreSQL ${{ matrix.pg_version }}
     runs-on: windows-latest
@@ -167,7 +169,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 with MinGW-w64 toolchain and Perl
+      - name: Setup MSYS2 with MinGW-w64 toolchain and both Perl runtimes
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -180,18 +182,31 @@ jobs:
             bison
             flex
             diffutils
+            perl
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-perl
 
-      - name: Install PostgreSQL TAP prerequisite (IPC::Run)
+      # The TAP tests are driven by the MSYS (not MinGW) Perl: it reports
+      # osname=msys, so IPC::Run uses its Unix code path and Win32API::File is
+      # already provided by the MSYS perl package. This avoids the MinGW/CPAN
+      # mess around Win32::Process / Win32::ShellQuote.
+      - name: Install PostgreSQL TAP prerequisite (IPC::Run for MSYS Perl)
         run: |
           curl -L -o ipc-run.tar.gz \
             "https://cpan.metacpan.org/authors/id/T/TO/TODDR/IPC-Run-20231003.0.tar.gz"
           tar -xzf ipc-run.tar.gz
           cd IPC-Run-20231003.0
-          perl Makefile.PL
+          /usr/bin/perl.exe Makefile.PL
           make
           make install
+
+      - name: Fetch PostgreSQL ${{ matrix.pg_version }} sources and Perl test modules
+        run: |
+          curl -L -o pg-src.tar.gz \
+            "https://github.com/postgres/postgres/archive/refs/heads/REL_${{ matrix.pg_version }}_STABLE.tar.gz"
+          tar -xzf pg-src.tar.gz
+          echo "TAP_PERL_DIR=$(pwd)/postgres-REL_${{ matrix.pg_version }}_STABLE/src/test/perl" >> "$GITHUB_ENV"
+          echo "PROVE_BIN=/usr/bin/perl.exe /usr/bin/core_perl/prove" >> "$GITHUB_ENV"
 
       - name: Cache PostgreSQL ${{ matrix.pg_version }} build
         id: pg-cache
@@ -205,15 +220,11 @@ jobs:
         run: |
           set -e
           PREFIX="$(pwd)/pg-${{ matrix.pg_version }}"
-          curl -L -o pg-src.tar.gz \
-            "https://github.com/postgres/postgres/archive/refs/heads/REL_${{ matrix.pg_version }}_STABLE.tar.gz"
-          tar -xzf pg-src.tar.gz
           cd "postgres-REL_${{ matrix.pg_version }}_STABLE"
           ./configure \
             --prefix="$PREFIX" \
             --build="$MINGW_CHOST" \
             --host="$MINGW_CHOST" \
-            --enable-tap-tests \
             --disable-nls \
             --without-icu \
             --without-readline \
@@ -247,7 +258,7 @@ jobs:
           PGPORT: 5433
           PGHOST: 127.0.0.1
           PGUSER: postgres
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck
+        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE="$PROVE_BIN" PROVE_FLAGS="-I $TAP_PERL_DIR"
 
       - name: Show regression.diffs on failure
         if: failure()
