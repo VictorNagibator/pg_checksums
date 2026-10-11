@@ -261,6 +261,13 @@ jobs:
               printf '%s\n' '' "\$use_unix_sockets = 0 if \$Config{osname} eq 'cygwin';" '1;' >> "$f"
             fi
           done
+          # PostgreSQL 12 has no $use_unix_sockets knob: it picks TCP vs Unix
+          # sockets from $TestLib::windows_os, which is false for the Cygwin
+          # based MSYS Perl. Force TCP in PostgresNode's INIT block instead.
+          if [ -f "$TAP_PERL_DIR/PostgresNode.pm" ] &&
+             grep -q '\$use_tcp[[:space:]]*=[[:space:]]*\$TestLib::windows_os;' "$TAP_PERL_DIR/PostgresNode.pm"; then
+            sed -i 's/^\([[:space:]]*\$use_tcp[[:space:]]*=[[:space:]]*\)\$TestLib::windows_os;/\1 1;/' "$TAP_PERL_DIR/PostgresNode.pm"
+          fi
           for f in "$TAP_PERL_DIR/PostgreSQL/Test/Cluster.pm" "$TAP_PERL_DIR/PostgresNode.pm"; do
             if [ -f "$f" ]; then
               sed -i 's/chomp \$\$stdout;/$$stdout =~ s\/\\r\\n\/\\n\/g; chomp $$stdout;/g; s/chomp \$\$stderr;/$$stderr =~ s\/\\r\\n\/\\n\/g; chomp $$stderr;/g' "$f"
