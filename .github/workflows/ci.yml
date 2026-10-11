@@ -258,7 +258,11 @@ jobs:
           PGPORT: 5433
           PGHOST: 127.0.0.1
           PGUSER: postgres
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE="$PROVE_BIN" PROVE_FLAGS="-I $TAP_PERL_DIR"
+        run: |
+          # pg_regress.exe links against libpq.dll, which lives in the
+          # PostgreSQL bin directory, so it must be on PATH.
+          export PATH="$(dirname "$PG_CONFIG"):$PATH"
+          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE="$PROVE_BIN" PROVE_FLAGS="-I $TAP_PERL_DIR"
 
       - name: Show regression.diffs on failure
         if: failure()
