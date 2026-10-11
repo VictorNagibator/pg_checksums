@@ -11,16 +11,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Linux - full PostgreSQL version matrix (14 - 18) using the PGDG packages.
+  # Linux - full PostgreSQL version matrix (12 - 18) using the PGDG packages.
   # Regression tests and TAP tests are both executed.
+  # PostgreSQL 12 and 13 are out of support upstream: PGDG still builds them,
+  # but only for older Ubuntu releases, so those two jobs stay on 22.04.
   linux:
     name: Linux / PostgreSQL ${{ matrix.pg_version }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
 
     strategy:
       fail-fast: false
       matrix:
         pg_version: [14, 15, 16, 17, 18]
+        include:
+          - pg_version: 12
+            os: ubuntu-22.04
+          - pg_version: 13
+            os: ubuntu-22.04
 
     env:
       PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
@@ -52,7 +59,11 @@ jobs:
           sudo -u postgres psql -p 5433 -c "CREATE USER runner WITH SUPERUSER;"
 
       - name: Run regression tests and TAP tests
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck
+        run: |
+          # The TAP framework shells out to initdb/pg_ctl/psql, but Debian
+          # keeps the versioned binaries outside the default PATH.
+          export PATH="/usr/lib/postgresql/${{ matrix.pg_version }}/bin:$PATH"
+          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE=prove
         env:
           PGPORT: 5433
 
@@ -69,11 +80,14 @@ jobs:
         if: always()
         run: sudo pg_dropcluster ${{ matrix.pg_version }} testcluster --stop || true
 
-  # macOS - full PostgreSQL version matrix (14 - 18) using Homebrew bottles.
-  # Homebrew's PostgreSQL is built without --enable-tap-tests, so the TAP Perl
-  # modules are not installed. We download the matching PostgreSQL source's
-  # src/test/perl tree and force the PGXS TAP target on, so that TAP tests run
-  # here as well.
+  # macOS - full PostgreSQL version matrix (12 - 18).
+  # Homebrew ships bottles for 14 and newer. postgresql@12 and postgresql@13
+  # are disabled in Homebrew, so those two versions are compiled from source
+  # instead (the matching source tree is downloaded anyway for its TAP Perl
+  # modules). Homebrew's PostgreSQL is built without --enable-tap-tests, so the
+  # TAP Perl modules are not installed. We download the matching PostgreSQL
+  # source's src/test/perl tree and force the PGXS TAP target on, so that TAP
+  # tests run here as well.
   macos:
     name: macOS / PostgreSQL ${{ matrix.pg_version }}
     runs-on: macos-latest
@@ -81,19 +95,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [14, 15, 16, 17, 18]
+        pg_version: [12, 13, 14, 15, 16, 17, 18]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install PostgreSQL ${{ matrix.pg_version }} and Perl
+      - name: Install Perl, bison and flex
         run: |
-          brew install postgresql@${{ matrix.pg_version }} perl
-          echo "PG_CONFIG=$(brew --prefix postgresql@${{ matrix.pg_version }})/bin/pg_config" >> "$GITHUB_ENV"
+          # bison/flex are needed to build PostgreSQL 12/13 from the source
+          # archive below (it does not ship the generated parser files); the
+          # Homebrew versions are keg-only, hence the PATH updates.
+          brew install perl bison flex
           echo "$(brew --prefix perl)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
 
-      - name: Install TAP prerequisites (IPC::Run and PostgreSQL Perl test modules)
+      - name: Install PostgreSQL ${{ matrix.pg_version }} (Homebrew, 14+)
+        if: matrix.pg_version >= 14
+        run: |
+          brew install postgresql@${{ matrix.pg_version }}
+          echo "PG_CONFIG=$(brew --prefix postgresql@${{ matrix.pg_version }})/bin/pg_config" >> "$GITHUB_ENV"
+
+      - name: Install TAP prerequisites and fetch PostgreSQL ${{ matrix.pg_version }} sources
         run: |
           curl -L -o "$RUNNER_TEMP/ipc-run.tar.gz" \
             "https://cpan.metacpan.org/authors/id/T/TO/TODDR/IPC-Run-20231003.0.tar.gz"
@@ -102,7 +126,24 @@ jobs:
           curl -L -o "$RUNNER_TEMP/pg-src.tar.gz" \
             "https://github.com/postgres/postgres/archive/refs/heads/REL_${{ matrix.pg_version }}_STABLE.tar.gz"
           tar -xzf "$RUNNER_TEMP/pg-src.tar.gz" -C "$RUNNER_TEMP"
+          echo "PG_SRC=$RUNNER_TEMP/postgres-REL_${{ matrix.pg_version }}_STABLE" >> "$GITHUB_ENV"
           echo "TAP_PERL_DIR=$RUNNER_TEMP/postgres-REL_${{ matrix.pg_version }}_STABLE/src/test/perl" >> "$GITHUB_ENV"
+
+      - name: Build and install PostgreSQL ${{ matrix.pg_version }} from source (12, 13)
+        if: matrix.pg_version < 14
+        run: |
+          PREFIX="$RUNNER_TEMP/pg-${{ matrix.pg_version }}"
+          cd "$PG_SRC"
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-nls \
+            --without-icu \
+            --without-readline \
+            --without-zlib
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          echo "PG_CONFIG=$PREFIX/bin/pg_config" >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
 
       - name: Build extension
         run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
@@ -145,7 +186,7 @@ jobs:
           PGBIN="$(dirname "$PG_CONFIG")"
           "$PGBIN/pg_ctl" -D "$PGDATA" -m immediate stop || true
 
-  # Windows - full PostgreSQL version matrix (14 - 18).
+  # Windows - full PostgreSQL version matrix (12 - 18).
   # The official PostgreSQL binaries are built with MSVC and do not ship PGXS,
   # so PostgreSQL is compiled from source with MinGW-w64 inside MSYS2 (the same
   # way MSYS2 packages PostgreSQL). The resulting install is cached between runs,
@@ -159,7 +200,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [14, 15, 16, 17, 18]
+        pg_version: [12, 13, 14, 15, 16, 17, 18]
 
     defaults:
       run:
@@ -231,7 +272,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pg-${{ matrix.pg_version }}
-          key: ${{ runner.os }}-pg-${{ matrix.pg_version }}-v1
+          key: ${{ runner.os }}-pg-${{ matrix.pg_version }}-v2
           restore-keys: |
             ${{ runner.os }}-pg-${{ matrix.pg_version }}-
 
@@ -241,6 +282,15 @@ jobs:
           set -e
           PREFIX="$(pwd)/pg-${{ matrix.pg_version }}"
           cd "postgres-REL_${{ matrix.pg_version }}_STABLE"
+          # GCC 14 turned several formerly warning-only diagnostics (implicit
+          # function declarations, incompatible pointer types, ...) into errors
+          # by default. PostgreSQL 12 and 13 predate that change, so keep them
+          # as warnings for the legacy branches.
+          case "${{ matrix.pg_version }}" in
+            12|13)
+              export CFLAGS="-Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
+              ;;
+          esac
           ./configure \
             --prefix="$PREFIX" \
             --build="$MINGW_CHOST" \

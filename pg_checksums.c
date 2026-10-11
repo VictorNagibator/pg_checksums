@@ -98,6 +98,19 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_class.h" 
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_am.h"          /* *_AM_OID (all supported versions) */
+
+/*
+ * The OID of the pg_index_indrelid_index index is exposed differently
+ * depending on the release: PostgreSQL 13 and older declare it in
+ * catalog/indexing.h, while PostgreSQL 14 and newer generate it into
+ * catalog/pg_index_d.h.
+ */
+#if PG_VERSION_NUM >= 140000
+#include "catalog/pg_index_d.h"     /* IndexIndrelidIndexId */
+#else
+#include "catalog/indexing.h"       /* IndexIndrelidIndexId */
+#endif
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/dsm.h"

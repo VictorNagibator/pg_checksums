@@ -10,9 +10,16 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use PostgreSQL::Test::Cluster;
 
-# Set up test node
+# Set up test node.
+#
+# The node is initialized with allows_streaming => 1 so that it runs with
+# wal_level = replica instead of the TAP framework default of wal_level =
+# minimal. With minimal WAL, an index rebuilt by VACUUM FULL or REINDEX can be
+# byte-for-byte identical to the original on PostgreSQL 13 and older, making
+# its physical checksum legitimately unchanged (which is exactly what the
+# physical-vs-logical assertions below would then report as a failure).
 my $node = PostgreSQL::Test::Cluster->new('checksum_stability');
-$node->init;
+$node->init(allows_streaming => 1);
 $node->start;
 
 # Create extension

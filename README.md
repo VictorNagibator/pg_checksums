@@ -47,8 +47,13 @@
 
 ### Prerequisites
 
-* PostgreSQL 14 or later (tested on 14, 15, 16, 17, and 18)
+* PostgreSQL 12 or later (tested on 12, 13, 14, 15, 16, 17, and 18)
 * C compiler and PostgreSQL development headers
+
+> **Note:** PostgreSQL 12 and 13 are past end-of-life upstream, but they are
+> still fully supported by this extension. The build deliberately fails with a
+> clear error on PostgreSQL 11 and older, which lack the table-AM API the
+> extension relies on.
 
 ### Build and Install
 
@@ -465,9 +470,16 @@ linear speedup up to the point where the scan becomes I/O-bound.
 The pg_checksums extension includes a comprehensive test suite that validates functionality at all granularity levels and ensures algorithm correctness. The tests are divided into two categories: regression tests (SQL-based) and TAP tests (Perl-based).
 
 ```bash
-# Run regression (and TAP if enabled) tests
+# Run the regression tests
 make USE_PGXS=1 installcheck
+
+# Run the regression and TAP tests (TAP needs the IPC::Run Perl module and the
+# PostgreSQL test modules shipped with the matching server release)
+make USE_PGXS=1 installcheck enable_tap_tests=yes PROVE=prove
 ```
+
+CI runs both suites on every supported major version (PostgreSQL 12 through 18)
+on Linux, macOS, and Windows.
 
 **Tests cover:**
 

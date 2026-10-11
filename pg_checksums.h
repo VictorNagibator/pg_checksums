@@ -26,6 +26,16 @@
 #ifndef PG_CHECKSUMS_H
 #define PG_CHECKSUMS_H
 
+/*
+ * The extension relies on the table-AM abstraction (table_open(),
+ * table_beginscan(), ...) that became mandatory in PostgreSQL 12, as well as
+ * on the generated catalog OID headers introduced around the same time.
+ * PostgreSQL 11 and older are therefore not supported.
+ */
+#if PG_VERSION_NUM < 120000
+#error "pg_checksums requires PostgreSQL 12 or later"
+#endif
+
 #include "postgres.h"
 #include "fmgr.h"
 #include "catalog/pg_operator.h"

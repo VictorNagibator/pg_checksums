@@ -140,7 +140,7 @@ $$;
 WITH group_checksums AS (
     SELECT 
         group_id,
-        BIT_XOR(pg_tuple_physical_checksum('test_table_checksum'::regclass, ctid, false)) as group_checksum
+        SUM(pg_tuple_physical_checksum('test_table_checksum'::regclass, ctid, false)) as group_checksum
     FROM test_table_checksum
     GROUP BY group_id
 )
