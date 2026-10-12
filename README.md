@@ -542,7 +542,7 @@ The script uses the same environment settings as your manual commands. You can a
 
 The `dist` target packs the current `HEAD` into the archive that PGXN expects
 (`pg_checksums-<version>.zip`, with everything under a `pg_checksums-<version>/`
-directory), so commit and tag the release first:
+directory):
 
 ```bash
 make dist
