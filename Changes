@@ -1,0 +1,13 @@
+Revision history for pg_checksums
+
+1.0.0   2026-10-12
+
+    - First public release on PGXN.
+    - Checksum functions at six levels: page, cell, tuple, table, index and
+      database, in physical and logical variants (cell level is logical only).
+    - FNV-1a 32-bit implementation, with order-independent aggregation so that
+      table, index and database checksums do not depend on scan order.
+    - Parallel scans for table, index and database checksums, controlled by the
+      pg_checksums.workers GUC.
+    - Partitioned tables are aggregated over all leaf partitions.
+    - Supports PostgreSQL 12, 13, 14, 15, 16, 17 and 18.

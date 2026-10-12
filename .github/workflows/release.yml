@@ -1,0 +1,135 @@
+name: Release
+
+# Pushing a v* tag builds the PGXN distribution archive with `make dist`,
+# attaches it to a GitHub Release and, when the PGXN credentials are
+# configured, uploads it to https://manager.pgxn.org/.
+#
+# Required repository secrets for the PGXN upload:
+#   PGXN_USERNAME  - PGXN Manager account name
+#   PGXN_PASSWORD  - its password
+# Without them the release is still created on GitHub and the PGXN step is
+# skipped with a warning.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Package and publish
+    runs-on: ubuntu-latest
+
+    env:
+      PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
+      PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check that the tag matches the extension version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          ctrl="$(sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/p" pg_checksums.control)"
+          meta="$(python3 -c "import json; print(json.load(open('META.json'))['version'])")"
+          prov="$(python3 -c "import json; print(json.load(open('META.json'))['provides']['pg_checksums']['version'])")"
+
+          echo "tag=$tag control=$ctrl meta=$meta provides=$prov"
+
+          if [ "$tag" != "v$ctrl" ]; then
+            echo "::error::tag $tag does not match the control file version ($ctrl)"
+            exit 1
+          fi
+          if [ "$meta" != "$ctrl" ] || [ "$prov" != "$ctrl" ]; then
+            echo "::error::META.json ($meta / $prov) does not match the control file version ($ctrl)"
+            exit 1
+          fi
+
+          echo "version=$ctrl" >> "$GITHUB_OUTPUT"
+
+      - name: Build the PGXN distribution archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          make dist
+          ls -l "pg_checksums-${VERSION}.zip"
+
+      - name: Verify the archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_pgxn_archive.py \
+            "pg_checksums-${VERSION}.zip" "$VERSION"
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="pg_checksums-${VERSION}.zip"
+
+          prerelease=""
+          case "$GITHUB_REF_NAME" in
+            *-rc*|*-beta*|*-alpha*) prerelease="--prerelease" ;;
+          esac
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; uploading the archive."
+            gh release upload "$GITHUB_REF_NAME" "$archive" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$archive" \
+              --title "pg_checksums ${VERSION}" \
+              --generate-notes $prerelease
+          fi
+
+      - name: Upload to PGXN
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="pg_checksums-${VERSION}.zip"
+
+          if [ -z "${PGXN_USERNAME:-}" ] || [ -z "${PGXN_PASSWORD:-}" ]; then
+            {
+              echo "### PGXN upload skipped"
+              echo
+              echo "Set the \`PGXN_USERNAME\` and \`PGXN_PASSWORD\` repository"
+              echo "secrets to publish releases to https://manager.pgxn.org/."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::PGXN credentials are not configured; skipping the PGXN upload"
+            exit 0
+          fi
+
+          status="$(curl -sS -o pgxn-response.txt -w '%{http_code}' \
+            -F "archive=@${archive};type=application/zip" \
+            -u "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
+            https://manager.pgxn.org/upload)"
+
+          echo "PGXN responded with HTTP ${status}"
+          cat pgxn-response.txt
+
+          case "$status" in
+            2*|3*)
+              echo "Uploaded ${archive} to PGXN"
+              ;;
+            409)
+              echo "${archive} is already on PGXN; nothing to do"
+              ;;
+            *)
+              echo "::error::PGXN upload failed with HTTP ${status}"
+              exit 1
+              ;;
+          esac

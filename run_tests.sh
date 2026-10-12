@@ -3,11 +3,11 @@
 
 set -e  # Exit on any error (except specially handled ones)
 
-# Settings
-PG_CONFIG="$HOME/postgres-custom/bin/pg_config"
-PGCTL="$HOME/postgres-custom/bin/pg_ctl"
-PGDATA="$HOME/pgdata-custom"
-JOBS=4
+# Settings (all overridable from the environment)
+PG_CONFIG="${PG_CONFIG:-$HOME/postgres-custom/bin/pg_config}"
+PGCTL="${PGCTL:-$(dirname "$PG_CONFIG")/pg_ctl}"
+PGDATA="${PGDATA:-$HOME/pgdata-custom}"
+JOBS="${JOBS:-4}"
 
 # Function to stop the PostgreSQL server and clean up build artifacts
 # (called on exit)
@@ -15,7 +15,7 @@ cleanup() {
     echo "Stopping PostgreSQL server..."
     "$PGCTL" stop -D "$PGDATA" -m fast 2>/dev/null || true
     echo "Cleaning up build artifacts..."
-    make USE_PGXS=1 clean 2>/dev/null || true
+    make clean 2>/dev/null || true
 }
 
 # Trap EXIT to ensure cleanup is called on normal or abnormal exit
@@ -26,15 +26,15 @@ cd "$(dirname "$0")"
 
 # 1. Clean
 echo ">>> Cleaning previous build"
-make USE_PGXS=1 clean
+make clean
 
 # 2. Build
 echo ">>> Building with -j$JOBS"
-make USE_PGXS=1 -j"$JOBS"
+make PG_CONFIG="$PG_CONFIG" -j"$JOBS"
 
 # 3. Install into the target PostgreSQL
 echo ">>> Installing extension"
-sudo make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+sudo make PG_CONFIG="$PG_CONFIG" install
 
 # 4. Start the server (ignore errors if already running)
 echo ">>> Starting PostgreSQL server"
@@ -50,7 +50,7 @@ sleep 2
 echo ">>> Running tests (make installcheck)"
 # We don't want set -e to abort on test failure, so we handle exit code manually
 set +e
-make USE_PGXS=1 installcheck
+make PG_CONFIG="$PG_CONFIG" installcheck
 TEST_RESULT=$?
 set -e
 

@@ -1,10 +1,18 @@
 # Makefile
+#
+# The extension is built with PGXS. That is what the PGXN client relies on:
+# it runs `make` and `make install` with nothing but PG_CONFIG in the
+# environment, so PGXS must be the default (there is no in-tree contrib build
+# path any more).
 
+EXTENSION = pg_checksums
 MODULE_big = pg_checksums
 OBJS = pg_checksums.o
 
-EXTENSION = pg_checksums
-DATA = pg_checksums--1.0.sql
+# The control file is the single source of truth for the extension version;
+# the versioned SQL script and the distribution archive name derive from it.
+EXTVERSION = $(shell sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/p" $(EXTENSION).control)
+DATA = $(EXTENSION)--$(EXTVERSION).sql
 
 REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition
 REGRESS_OPTS = \
@@ -13,13 +21,14 @@ REGRESS_OPTS = \
 
 TAP_TESTS = 2
 
-ifdef USE_PGXS
-PG_CONFIG = pg_config
+PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
-else
-subdir = contrib/pg_checksums
-top_builddir = ../..
-include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
-endif
+
+# Build the PGXN distribution archive. `git archive` packs HEAD, so commit
+# (and ideally tag) the release before running this.
+dist:
+	git archive --format zip --prefix=$(EXTENSION)-$(EXTVERSION)/ \
+		-o $(EXTENSION)-$(EXTVERSION).zip HEAD
+
+.PHONY: dist

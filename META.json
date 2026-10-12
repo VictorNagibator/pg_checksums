@@ -1,0 +1,51 @@
+{
+   "name": "pg_checksums",
+   "abstract": "Multi-level data integrity checksums for PostgreSQL",
+   "description": "pg_checksums provides checksum functions for PostgreSQL at six granularity levels (page, cell, tuple, table, index and database), each in a physical and a logical variant (cell level is logical only). Physical checksums detect storage corruption and change after VACUUM FULL, CLUSTER or REINDEX; logical checksums depend only on the data content and stay stable across physical reorganization. The implementation uses the FNV-1a 32-bit hash, supports parallel scans through the pg_checksums.workers GUC, and transparently aggregates partitioned tables.",
+   "version": "1.0.0",
+   "maintainer": [
+      "Viktor Donskoi <vityadonskoy2004@gmail.com>"
+   ],
+   "license": "mit",
+   "provides": {
+      "pg_checksums": {
+         "abstract": "Checksum functions at page, cell, tuple, table, index and database level",
+         "file": "pg_checksums--1.0.0.sql",
+         "docfile": "README.md",
+         "version": "1.0.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "12.0.0"
+         }
+      }
+   },
+   "resources": {
+      "repository": {
+         "url": "https://github.com/VictorNagibator/pg_checksums.git",
+         "web": "https://github.com/VictorNagibator/pg_checksums",
+         "type": "git"
+      },
+      "bugtracker": {
+         "web": "https://github.com/VictorNagibator/pg_checksums/issues"
+      }
+   },
+   "release_status": "stable",
+   "generated_by": "Viktor Donskoi",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "checksum",
+      "integrity",
+      "corruption",
+      "verification",
+      "fnv",
+      "parallel",
+      "partitioning",
+      "mvcc"
+   ]
+}

@@ -45,10 +45,10 @@ jobs:
           sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
 
       - name: Build extension
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+        run: make PG_CONFIG="$PG_CONFIG"
 
       - name: Install extension (into system PostgreSQL)
-        run: sudo make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+        run: sudo make PG_CONFIG="$PG_CONFIG" install
 
       - name: Setup test cluster
         run: |
@@ -63,7 +63,7 @@ jobs:
           # The TAP framework shells out to initdb/pg_ctl/psql, but Debian
           # keeps the versioned binaries outside the default PATH.
           export PATH="/usr/lib/postgresql/${{ matrix.pg_version }}/bin:$PATH"
-          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE=prove
+          make PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE=prove
         env:
           PGPORT: 5433
 
@@ -146,10 +146,10 @@ jobs:
           echo "$PREFIX/bin" >> "$GITHUB_PATH"
 
       - name: Build extension
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+        run: make PG_CONFIG="$PG_CONFIG"
 
       - name: Install extension
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+        run: make PG_CONFIG="$PG_CONFIG" install
 
       - name: Setup test cluster
         run: |
@@ -161,7 +161,7 @@ jobs:
           echo "PGDATA=$PGDATA" >> "$GITHUB_ENV"
 
       - name: Run regression tests and TAP tests
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE=prove PROVE_FLAGS="-I $TAP_PERL_DIR"
+        run: make PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE=prove PROVE_FLAGS="-I $TAP_PERL_DIR"
         env:
           PGPORT: 5433
           PGHOST: 127.0.0.1
@@ -316,10 +316,10 @@ jobs:
         run: '"$PG_CONFIG" --version'
 
       - name: Build extension
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+        run: make PG_CONFIG="$PG_CONFIG"
 
       - name: Install extension
-        run: make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+        run: make PG_CONFIG="$PG_CONFIG" install
 
       - name: Setup test cluster
         run: |
@@ -339,7 +339,7 @@ jobs:
           # pg_regress.exe links against libpq.dll, which lives in the
           # PostgreSQL bin directory, so it must be on PATH.
           export PATH="$(dirname "$PG_CONFIG"):$PATH"
-          make USE_PGXS=1 PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE="$PROVE_BIN" PROVE_FLAGS="-I $TAP_PERL_DIR"
+          make PG_CONFIG="$PG_CONFIG" installcheck enable_tap_tests=yes PROVE="$PROVE_BIN" PROVE_FLAGS="-I $TAP_PERL_DIR"
 
       - name: Show regression.diffs on failure
         if: failure()

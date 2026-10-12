@@ -55,7 +55,15 @@
 > clear error on PostgreSQL 11 and older, which lack the table-AM API the
 > extension relies on.
 
+> **Note:** the distribution is named `pg_checksums`, the same name as the
+> `pg_checksums` utility shipped with PostgreSQL core. They are unrelated: the
+> core utility verifies data page checksums on disk, while this extension
+> provides SQL functions for computing checksums.
+
 ### Build and Install
+
+The extension builds with PGXS, so `pg_config` must be on your `PATH`, or you
+can point `make` at a specific installation with `PG_CONFIG=/path/to/pg_config`.
 
 ```bash
 # Clone or extract the extension
@@ -65,13 +73,20 @@ git clone https://github.com/VictorNagibator/pg_checksums
 cd pg_checksums
 
 # Build
-make USE_PGXS=1
+make
 
 # Install
-make USE_PGXS=1 install
+make install
 
 # Create extension in your database
 psql -d your_database -c "CREATE EXTENSION pg_checksums;"
+```
+
+Or install it straight from [PGXN](https://pgxn.org/dist/pg_checksums/) with the
+[pgxn client](https://github.com/pgxn/pgxnclient):
+
+```bash
+pgxn install pg_checksums
 ```
 
 ---
@@ -471,11 +486,11 @@ The pg_checksums extension includes a comprehensive test suite that validates fu
 
 ```bash
 # Run the regression tests
-make USE_PGXS=1 installcheck
+make installcheck
 
 # Run the regression and TAP tests (TAP needs the IPC::Run Perl module and the
 # PostgreSQL test modules shipped with the matching server release)
-make USE_PGXS=1 installcheck enable_tap_tests=yes PROVE=prove
+make installcheck enable_tap_tests=yes PROVE=prove
 ```
 
 CI runs both suites on every supported major version (PostgreSQL 12 through 18)
@@ -520,3 +535,44 @@ The script uses the same environment settings as your manual commands. You can a
 * `PGDATA` – data directory of the test cluster
 
 * `JOBS` – number of parallel build jobs (passed to `make -j`)
+
+---
+
+## Building a Release
+
+The `dist` target packs the current `HEAD` into the archive that PGXN expects
+(`pg_checksums-<version>.zip`, with everything under a `pg_checksums-<version>/`
+directory), so commit and tag the release first:
+
+```bash
+make dist
+```
+
+### Automated releases
+
+Pushing a `v*` tag runs the [Release workflow](.github/workflows/release.yml),
+which:
+
+1. checks that the tag, `pg_checksums.control` and `META.json` all carry the
+   same version;
+2. builds the archive with `make dist` and verifies its contents;
+3. creates the GitHub Release and attaches the archive (tags containing
+   `-rc`, `-beta` or `-alpha` are marked as pre-releases);
+4. uploads the archive to [PGXN](https://manager.pgxn.org/) when the
+   `PGXN_USERNAME` and `PGXN_PASSWORD` repository secrets are configured.
+
+```bash
+git tag -a v1.0.0 -m "pg_checksums 1.0.0"
+git push origin v1.0.0
+```
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+## Support
+
+* Source code and issue tracker: <https://github.com/VictorNagibator/pg_checksums>
+* Distribution page on PGXN: <https://pgxn.org/dist/pg_checksums/>

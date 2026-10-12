@@ -1,0 +1,26 @@
+# Build artifacts
+*.o
+*.so
+*.bc
+*.dll
+*.dylib
+*.a
+
+# pg_regress and TAP test output
+regression.diffs
+regression.out
+results/
+tmp_check/
+pg_stat_tmp/
+*.log
+
+# Distribution archives
+*.zip
+*.tar.gz
+*.tar.bz2
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
