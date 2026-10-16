@@ -4,6 +4,10 @@ name: Release
 # attaches it to a GitHub Release and, when the PGXN credentials are
 # configured, uploads it to https://manager.pgxn.org/.
 #
+# The release notes are taken from the Changes entry for the tagged version,
+# so a release without a matching Changes section fails instead of publishing
+# a bare "Full Changelog" note.
+#
 # Required repository secrets for the PGXN upload:
 #   PGXN_USERNAME  - PGXN Manager account name
 #   PGXN_PASSWORD  - its password
@@ -73,6 +77,31 @@ jobs:
           python3 .github/scripts/verify_pgxn_archive.py \
             "pg_checksums-${VERSION}.zip" "$VERSION"
 
+      - name: Build the release notes from Changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="release-notes.md"
+
+          if ! python3 .github/scripts/changelog_for_version.py "$VERSION" > "$notes"; then
+            echo "::error::No Changes entry for ${VERSION}; add one before tagging."
+            exit 1
+          fi
+
+          # Same "Full Changelog" footer that GitHub's generated notes carry.
+          previous="$(gh release list --exclude-drafts --limit 1 \
+            --json tagName --jq '.[0].tagName // empty' 2>/dev/null || true)"
+          if [ -n "$previous" ] && [ "$previous" != "$GITHUB_REF_NAME" ]; then
+            printf '\n**Full Changelog**: %s/%s/compare/%s...%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" \
+              "$previous" "$GITHUB_REF_NAME" >> "$notes"
+          fi
+
+          echo "----- release notes -----"
+          cat "$notes"
+
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,6 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           archive="pg_checksums-${VERSION}.zip"
+          notes="release-notes.md"
 
           prerelease=""
           case "$GITHUB_REF_NAME" in
@@ -87,12 +117,13 @@ jobs:
           esac
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists; uploading the archive."
+            echo "Release $GITHUB_REF_NAME already exists; refreshing it."
+            gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"
             gh release upload "$GITHUB_REF_NAME" "$archive" --clobber
           else
             gh release create "$GITHUB_REF_NAME" "$archive" \
               --title "pg_checksums ${VERSION}" \
-              --generate-notes $prerelease
+              --notes-file "$notes" $prerelease
           fi
 
       - name: Upload to PGXN

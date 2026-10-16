@@ -556,14 +556,19 @@ which:
 1. checks that the tag, `pg_checksums.control` and `META.json` all carry the
    same version;
 2. builds the archive with `make dist` and verifies its contents;
-3. creates the GitHub Release and attaches the archive (tags containing
+3. takes the release notes from the matching `Changes` entry (the release fails
+   if there is none, rather than publishing an empty note);
+4. creates the GitHub Release and attaches the archive (tags containing
    `-rc`, `-beta` or `-alpha` are marked as pre-releases);
-4. uploads the archive to [PGXN](https://manager.pgxn.org/) when the
+5. uploads the archive to [PGXN](https://manager.pgxn.org/) when the
    `PGXN_USERNAME` and `PGXN_PASSWORD` repository secrets are configured.
 
+So bump the version in `pg_checksums.control`, `META.json` and `Changes`, add
+the new SQL script (and an upgrade script if needed), and only then tag:
+
 ```bash
-git tag -a v1.0.0 -m "pg_checksums 1.0.0"
-git push origin v1.0.0
+git tag -a v1.1.0 -m "pg_checksums 1.1.0"
+git push origin v1.1.0
 ```
 
 ---
