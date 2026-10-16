@@ -1,6 +1,8 @@
 # pg_checksums - Multi-Level Data Integrity Extension for PostgreSQL
 
 [![CI](https://github.com/VictorNagibator/pg_checksums/actions/workflows/ci.yml/badge.svg)](https://github.com/VictorNagibator/pg_checksums/actions/workflows/ci.yml)
+[![PostgreSQL 12-18](https://img.shields.io/badge/postgres-12--18-336791)](https://www.postgresql.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Overview
 
