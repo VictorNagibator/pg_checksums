@@ -10,9 +10,11 @@ MODULE_big = pg_checksums
 OBJS = pg_checksums.o
 
 # The control file is the single source of truth for the extension version;
-# the versioned SQL script and the distribution archive name derive from it.
+# the distribution archive name derives from it.
 EXTVERSION = $(shell sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/p" $(EXTENSION).control)
-DATA = $(EXTENSION)--$(EXTVERSION).sql
+
+# Every versioned install script and every upgrade script between them.
+DATA = $(wildcard $(EXTENSION)--*.sql)
 
 REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition
 REGRESS_OPTS = \

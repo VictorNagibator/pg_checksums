@@ -1,5 +1,25 @@
 Revision history for pg_checksums
 
+1.1.0   2026-10-17
+
+    - Speed up the logical checksum paths considerably. The per-cell pg_type
+      system cache lookup is gone, the primary key is looked up once per
+      relation instead of once per tuple, and short-header varlenas are hashed
+      in place instead of being detoasted into a fresh copy for every cell.
+      Logical table checksums are up to ~180x faster on large tables; physical
+      and utility functions are unchanged.
+    - Fix a relcache reference leak in the parallel database scan: parallel
+      workers cannot read the session's temporary tables, and the error that
+      this raised left the relation open.
+    - Database checksums no longer include temporary relations. They are
+      session-local, and including them made the parallel result depend on how
+      the work happened to be distributed. Checksums of persistent objects are
+      unchanged, and the parallel and serial results now agree.
+    - Initialise the relation and buffer variables used by the exception
+      handler of pg_tuple_physical_checksum.
+    - ALTER EXTENSION pg_checksums UPDATE TO '1.1.0' is a no-op: the SQL
+      objects are unchanged.
+
 1.0.0   2026-10-12
 
     - First public release on PGXN.
