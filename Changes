@@ -1,5 +1,75 @@
 Revision history for pg_checksums
 
+1.1.1   2026-10-18
+
+    - Security: enforce SELECT privilege (and reject relations protected by
+      row-level security) in pg_page_checksum(), pg_cell_checksum(),
+      pg_tuple_*_checksum(), pg_table_*_checksum() and pg_index_*_checksum().
+      Previously any user could compute checksums of any relation, including
+      tables they could not read.
+    - Security: the database-level functions are no longer SECURITY DEFINER.
+      With SECURITY DEFINER, superuser() saw the owner and the superuser check
+      could be bypassed by any user.  EXECUTE is now revoked from PUBLIC, and
+      the extension can no longer be installed by a non-superuser.
+    - Fix a server crash (signal 11) when pg_index_logical_checksum() was
+      called on an SP-GiST index.  Logical index checksums are now B-tree
+      only; Hash, GiST, GIN, SP-GiST and BRIN return NULL instead of
+      returning a meaningless value.  Physical index checksums remain
+      available for all supported access methods.
+    - pg_page_checksum() now validates the block number.  A negative block
+      number used to be interpreted as P_NEW and silently extended the
+      relation; an out-of-range block is now an error.  The page is copied
+      before pg_checksum_page() is called, so the shared pd_checksum field is
+      never transiently zeroed in the buffer pool.
+    - Validate relkinds, line pointers, tuple headers and page headers before
+      following them.  A corrupted page or a bogus TID now produces a clean
+      error instead of reading out of bounds.  pg_cell_checksum() and
+      pg_tuple_logical_checksum() no longer read past PageGetMaxOffsetNumber.
+    - Fix PG_RETURN_NULL() inside PG_TRY and mark locals modified between
+      setjmp and longjmp as volatile in the tuple checksum functions.
+    - Database scans now run each relation in an internal subtransaction.
+      Errors release locks and buffer pins, are reported as a warning and no
+      longer produce a silently partial checksum.  Cancellation and statement
+      timeouts are propagated instead of being swallowed.
+    - Enter parallel mode before creating a parallel context and leave it
+      after destroying it.  This fixes assertion failures in --enable-cassert
+      builds and prevents the leader from starting nested parallel workers
+      during a database scan.  Workers are also clamped by
+      max_worker_processes, and the block-chunk end calculation no longer
+      overflows.
+    - Physical checksums of TOAST relations now hash their raw pages instead
+      of misinterpreting toast tuples as heap tuples.  include_toast works
+      independently of include_system, and logical database checksums skip
+      TOAST relations (their content is covered by detoasting the parent
+      table).  Shared catalogs are excluded from per-database checksums even
+      when include_system is true.
+    - Physical table checksums no longer include relpages/reltuples.  Those
+      are planner statistics, not physical data: ANALYZE could change a
+      physical checksum without any data change, and the implicit float4 to
+      uint32 conversion was undefined for reltuples = -1.  Physical table and
+      database checksums computed with 1.1.0 must be refreshed.
+    - Tuple and table physical checksums no longer include the page LSN,
+      pd_checksum and pd_flags.  Hint-bit-only changes made by a concurrent
+      scan could change those fields, so serial and parallel scans of the same
+      table could disagree.  They now include the relation's relfilenode and
+      reltablespace, so VACUUM FULL, CLUSTER, REINDEX and SET TABLESPACE still
+      change physical checksums.  Page-level checksums still hash the raw
+      page bytes.
+    - Skip unsupported index access methods in physical database scans
+      instead of silently folding a zero checksum into the aggregate.
+    - pg_index_physical_checksum() and pg_index_logical_checksum() return NULL
+      for partitioned indexes until leaf-index aggregation is implemented.
+    - Logical checksums are unchanged for the same data.  Physical checksums
+      have intentionally changed: planner statistics and transient page
+      metadata were removed, and relfilenode/reltablespace were added.  Any
+      physical baseline computed with 1.1.0 must be refreshed.  Database
+      checksums can also change when include_system/include_toast is used
+      (shared catalogs and unsupported indexes are now handled correctly) or
+      when a database contains non-B-tree indexes.
+    - TAP tests are opt-in again (enable_tap_tests=yes), matching the README,
+      and run_tests.sh no longer stops a server it did not start and no longer
+      requires sudo unconditionally.
+
 1.1.0   2026-10-17
 
     - Speed up the logical checksum paths considerably. The per-cell pg_type

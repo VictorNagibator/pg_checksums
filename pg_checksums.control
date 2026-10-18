@@ -1,7 +1,10 @@
 # pg_checksums.control
 
 comment = 'Checksum functions for PostgreSQL at tuple, column, table, index and database levels'
-default_version = '1.1.0'
+default_version = '1.1.1'
 module_pathname = '$libdir/pg_checksums'
 relocatable = true
-superuser = false
+# Creating a C extension that reads relation storage should require a
+# superuser.  The SQL functions themselves additionally enforce SELECT
+# privileges (and superuser-only access for the database-level functions).
+superuser = true

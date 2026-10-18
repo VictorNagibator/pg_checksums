@@ -16,12 +16,16 @@ EXTVERSION = $(shell sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\([^']*
 # Every versioned install script and every upgrade script between them.
 DATA = $(wildcard $(EXTENSION)--*.sql)
 
-REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition
+REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition checksum_safety
 REGRESS_OPTS = \
     --inputdir=./ \
     --load-extension=pg_checksums
 
-TAP_TESTS = 2
+# TAP tests are opt-in: they need the PostgreSQL test modules and IPC::Run.
+# Run "make installcheck enable_tap_tests=yes PROVE=prove" to include them.
+ifdef enable_tap_tests
+TAP_TESTS = 1
+endif
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

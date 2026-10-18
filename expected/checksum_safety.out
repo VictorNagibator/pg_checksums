@@ -1,0 +1,309 @@
+-- Safety, validation and privilege tests for pg_checksums
+-- Test A: non-B-tree logical index checksums return NULL and do not crash,
+-- while physical checksums remain available for every supported AM.
+CREATE TABLE test_safety_index (
+    id integer PRIMARY KEY,
+    i integer NOT NULL,
+    t text NOT NULL,
+    r int4range,
+    ts tsvector
+);
+INSERT INTO test_safety_index
+SELECT gs, gs, 't_' || gs, int4range(gs, gs + 10), to_tsvector('item ' || gs)
+FROM generate_series(1, 200) gs;
+CREATE INDEX test_safety_btree ON test_safety_index (i);
+CREATE INDEX test_safety_hash ON test_safety_index USING hash (t);
+CREATE INDEX test_safety_gist ON test_safety_index USING gist (r);
+CREATE INDEX test_safety_gin ON test_safety_index USING gin (ts);
+CREATE INDEX test_safety_spgist ON test_safety_index USING spgist (r);
+CREATE INDEX test_safety_brin ON test_safety_index USING brin (id);
+SELECT
+    pg_index_logical_checksum('test_safety_btree'::regclass) IS NOT NULL AS btree_logical,
+    pg_index_logical_checksum('test_safety_hash'::regclass) IS NULL AS hash_logical_null,
+    pg_index_logical_checksum('test_safety_gist'::regclass) IS NULL AS gist_logical_null,
+    pg_index_logical_checksum('test_safety_gin'::regclass) IS NULL AS gin_logical_null,
+    pg_index_logical_checksum('test_safety_spgist'::regclass) IS NULL AS spgist_logical_null,
+    pg_index_logical_checksum('test_safety_brin'::regclass) IS NULL AS brin_logical_null;
+ btree_logical | hash_logical_null | gist_logical_null | gin_logical_null | spgist_logical_null | brin_logical_null 
+---------------+-------------------+-------------------+------------------+---------------------+-------------------
+ t             | t                 | t                 | t                | t                   | t
+(1 row)
+
+SELECT
+    pg_index_physical_checksum('test_safety_btree'::regclass) IS NOT NULL AS btree_physical,
+    pg_index_physical_checksum('test_safety_hash'::regclass) IS NOT NULL AS hash_physical,
+    pg_index_physical_checksum('test_safety_gist'::regclass) IS NOT NULL AS gist_physical,
+    pg_index_physical_checksum('test_safety_gin'::regclass) IS NOT NULL AS gin_physical,
+    pg_index_physical_checksum('test_safety_spgist'::regclass) IS NOT NULL AS spgist_physical,
+    pg_index_physical_checksum('test_safety_brin'::regclass) IS NOT NULL AS brin_physical;
+ btree_physical | hash_physical | gist_physical | gin_physical | spgist_physical | brin_physical 
+----------------+---------------+---------------+--------------+-----------------+---------------
+ t              | t             | t             | t            | t               | t
+(1 row)
+
+-- Test B: partitioned indexes have no storage of their own.
+CREATE TABLE test_safety_part (
+    id integer,
+    region text NOT NULL,
+    PRIMARY KEY (id, region)
+) PARTITION BY LIST (region);
+CREATE TABLE test_safety_part_x PARTITION OF test_safety_part FOR VALUES IN ('x');
+CREATE INDEX test_safety_part_region ON test_safety_part (region);
+SELECT
+    pg_index_physical_checksum('test_safety_part_region'::regclass) IS NULL AS partitioned_physical_null,
+    pg_index_logical_checksum('test_safety_part_region'::regclass) IS NULL AS partitioned_logical_null;
+ partitioned_physical_null | partitioned_logical_null 
+---------------------------+--------------------------
+ t                         | t
+(1 row)
+
+-- Test C: pg_page_checksum validates the block number and never extends the
+-- relation (a negative block number used to mean P_NEW).
+CREATE TABLE test_safety_page (id integer PRIMARY KEY, v text);
+INSERT INTO test_safety_page SELECT gs, 'v_' || gs FROM generate_series(1, 100) gs;
+DO $$
+DECLARE
+    size_before bigint;
+    size_after bigint;
+    raised boolean;
+BEGIN
+    size_before := pg_relation_size('test_safety_page');
+
+    raised := false;
+    BEGIN
+        PERFORM pg_page_checksum('test_safety_page'::regclass, -1);
+    EXCEPTION WHEN OTHERS THEN
+        raised := true;
+    END;
+    IF NOT raised THEN
+        RAISE EXCEPTION 'negative block number did not fail';
+    END IF;
+
+    raised := false;
+    BEGIN
+        PERFORM pg_page_checksum('test_safety_page'::regclass, 1000000);
+    EXCEPTION WHEN OTHERS THEN
+        raised := true;
+    END;
+    IF NOT raised THEN
+        RAISE EXCEPTION 'out-of-range block number did not fail';
+    END IF;
+
+    size_after := pg_relation_size('test_safety_page');
+    IF size_before <> size_after THEN
+        RAISE EXCEPTION 'pg_page_checksum changed the relation size';
+    END IF;
+END;
+$$;
+SELECT pg_page_checksum('test_safety_page'::regclass, 0) IS NOT NULL AS valid_page_checksum;
+ valid_page_checksum 
+---------------------
+ t
+(1 row)
+
+-- Test D: out-of-range TIDs are handled without reading out of bounds.
+SELECT
+    pg_cell_checksum('test_safety_page'::regclass, '(0,20000)'::tid, 1) IS NULL AS cell_bad_offset_null,
+    pg_tuple_logical_checksum('test_safety_page'::regclass, '(0,20000)'::tid, false) IS NULL AS tuple_logical_bad_offset_null,
+    pg_tuple_physical_checksum('test_safety_page'::regclass, '(0,20000)'::tid, false) = 0 AS tuple_physical_bad_offset_zero,
+    pg_tuple_physical_checksum('test_safety_page'::regclass, '(1000000,1)'::tid, false) IS NULL AS tuple_physical_bad_block_null;
+ cell_bad_offset_null | tuple_logical_bad_offset_null | tuple_physical_bad_offset_zero | tuple_physical_bad_block_null 
+----------------------+-------------------------------+--------------------------------+-------------------------------
+ t                    | t                             | t                              | t
+(1 row)
+
+-- Test E: table/page/cell functions reject relations without heap storage.
+CREATE VIEW test_safety_view AS SELECT * FROM test_safety_page;
+CREATE SEQUENCE test_safety_seq;
+DO $$
+DECLARE
+    rejected boolean;
+BEGIN
+    rejected := false;
+    BEGIN
+        PERFORM pg_table_physical_checksum('test_safety_view'::regclass, false);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'table checksum accepted a view';
+    END IF;
+
+    rejected := false;
+    BEGIN
+        PERFORM pg_table_physical_checksum('test_safety_seq'::regclass, false);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'table checksum accepted a sequence';
+    END IF;
+
+    rejected := false;
+    BEGIN
+        PERFORM pg_table_physical_checksum('test_safety_page_pkey'::regclass, false);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'table checksum accepted an index';
+    END IF;
+
+    rejected := false;
+    BEGIN
+        PERFORM pg_page_checksum('test_safety_view'::regclass, 0);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'page checksum accepted a view';
+    END IF;
+
+    rejected := false;
+    BEGIN
+        PERFORM pg_cell_checksum('test_safety_view'::regclass, '(0,1)'::tid, 1);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'cell checksum accepted a view';
+    END IF;
+END;
+$$;
+-- Test F: SELECT privileges are enforced and RLS is rejected.
+CREATE TABLE test_safety_allowed (id integer PRIMARY KEY, v text);
+INSERT INTO test_safety_allowed SELECT gs, 'v_' || gs FROM generate_series(1, 100) gs;
+CREATE INDEX test_safety_allowed_v ON test_safety_allowed (v);
+CREATE TABLE test_safety_secret (id integer PRIMARY KEY, v text);
+INSERT INTO test_safety_secret VALUES (1, 'secret');
+CREATE TABLE test_safety_rls (id integer PRIMARY KEY, owner_name name, v text);
+INSERT INTO test_safety_rls VALUES (1, 'checksum_test_role', 'visible'),
+                                   (2, 'someone_else', 'hidden');
+CREATE ROLE checksum_test_role LOGIN;
+GRANT SELECT ON test_safety_allowed TO checksum_test_role;
+GRANT SELECT ON test_safety_rls TO checksum_test_role;
+REVOKE ALL ON test_safety_secret FROM PUBLIC;
+ALTER TABLE test_safety_rls ENABLE ROW LEVEL SECURITY;
+CREATE POLICY test_safety_rls_policy ON test_safety_rls
+    FOR SELECT USING (owner_name = current_user);
+SET ROLE checksum_test_role;
+SELECT
+    pg_table_physical_checksum('test_safety_allowed'::regclass, false) IS NOT NULL AS allowed_table,
+    pg_index_physical_checksum('test_safety_allowed_v'::regclass) IS NOT NULL AS allowed_index,
+    pg_page_checksum('test_safety_allowed'::regclass, 0) IS NOT NULL AS allowed_page;
+ allowed_table | allowed_index | allowed_page 
+---------------+---------------+--------------
+ t             | t             | t
+(1 row)
+
+DO $$
+DECLARE
+    denied boolean;
+BEGIN
+    denied := false;
+    BEGIN
+        PERFORM pg_table_physical_checksum('test_safety_secret'::regclass, false);
+    EXCEPTION WHEN insufficient_privilege THEN
+        denied := true;
+    END;
+    IF NOT denied THEN
+        RAISE EXCEPTION 'table checksum ignored SELECT privileges';
+    END IF;
+
+    denied := false;
+    BEGIN
+        PERFORM pg_cell_checksum('test_safety_secret'::regclass, '(0,1)'::tid, 2);
+    EXCEPTION WHEN insufficient_privilege THEN
+        denied := true;
+    END;
+    IF NOT denied THEN
+        RAISE EXCEPTION 'cell checksum ignored SELECT privileges';
+    END IF;
+
+    denied := false;
+    BEGIN
+        PERFORM pg_index_physical_checksum('test_safety_secret_pkey'::regclass);
+    EXCEPTION WHEN insufficient_privilege THEN
+        denied := true;
+    END;
+    IF NOT denied THEN
+        RAISE EXCEPTION 'index checksum ignored SELECT privileges';
+    END IF;
+
+    denied := false;
+    BEGIN
+        PERFORM pg_cell_checksum('test_safety_rls'::regclass, '(0,1)'::tid, 3);
+    EXCEPTION WHEN insufficient_privilege THEN
+        denied := true;
+    END;
+    IF NOT denied THEN
+        RAISE EXCEPTION 'cell checksum ignored row-level security';
+    END IF;
+END;
+$$;
+RESET ROLE;
+-- The database functions are superuser-only even when EXECUTE is granted.
+GRANT EXECUTE ON FUNCTION pg_database_physical_checksum(boolean, boolean) TO checksum_test_role;
+GRANT EXECUTE ON FUNCTION pg_database_logical_checksum(boolean, boolean) TO checksum_test_role;
+SET ROLE checksum_test_role;
+DO $$
+DECLARE
+    denied boolean;
+BEGIN
+    denied := false;
+    BEGIN
+        PERFORM pg_database_physical_checksum(false, false);
+    EXCEPTION WHEN insufficient_privilege THEN
+        denied := true;
+    END;
+    IF NOT denied THEN
+        RAISE EXCEPTION 'database physical checksum did not require superuser';
+    END IF;
+
+    denied := false;
+    BEGIN
+        PERFORM pg_database_logical_checksum(false, false);
+    EXCEPTION WHEN insufficient_privilege THEN
+        denied := true;
+    END;
+    IF NOT denied THEN
+        RAISE EXCEPTION 'database logical checksum did not require superuser';
+    END IF;
+END;
+$$;
+RESET ROLE;
+-- Test G: TOAST relations are checksummed as raw pages for physical checksums
+-- and return NULL for logical checksums.
+CREATE TABLE test_safety_toast (id integer PRIMARY KEY, v text);
+INSERT INTO test_safety_toast
+SELECT gs, repeat(md5(gs::text), 1000) FROM generate_series(1, 30) gs;
+SELECT
+    pg_table_physical_checksum(c.reltoastrelid::regclass, false) IS NOT NULL AS toast_physical,
+    pg_table_logical_checksum(c.reltoastrelid::regclass) IS NULL AS toast_logical_null
+FROM pg_class c
+WHERE c.oid = 'test_safety_toast'::regclass;
+ toast_physical | toast_logical_null 
+----------------+--------------------
+ t              | t
+(1 row)
+
+SELECT
+    pg_database_physical_checksum(false, true) IS NOT NULL AS include_toast_physical,
+    pg_database_logical_checksum(false, true) IS NOT NULL AS include_toast_logical;
+ include_toast_physical | include_toast_logical 
+------------------------+-----------------------
+ t                      | t
+(1 row)
+
+-- Clean up.
+DROP TABLE test_safety_index;
+DROP TABLE test_safety_part;
+DROP TABLE test_safety_page CASCADE;
+NOTICE:  drop cascades to view test_safety_view
+DROP TABLE test_safety_allowed;
+DROP TABLE test_safety_secret;
+DROP TABLE test_safety_rls;
+DROP TABLE test_safety_toast;
+DROP SEQUENCE test_safety_seq;
+DROP OWNED BY checksum_test_role;
+DROP ROLE checksum_test_role;

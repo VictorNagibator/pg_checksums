@@ -88,9 +88,6 @@
 #include "access/genam.h"
 #include "access/nbtree.h"
 #include "access/brin.h"
-#include "access/brin_revmap.h"
-#include "access/brin_page.h"
-#include "access/xlogdefs.h"
 #include "access/parallel.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
@@ -100,6 +97,7 @@
 #include "catalog/pg_class.h" 
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_am.h"          /* *_AM_OID (all supported versions) */
+#include "catalog/index.h"          /* IndexGetRelation */
 
 /*
  * The OID of the pg_index_indrelid_index index is exposed differently
@@ -116,10 +114,14 @@
 #include "storage/bufpage.h"
 #include "storage/dsm.h"
 #include "storage/shm_toc.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/errcodes.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
+#include "utils/rls.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
 #include "utils/guc.h"
@@ -190,6 +192,13 @@ pg_checksums_worker_count(void)
     if (workers > max_parallel_workers)
         workers = max_parallel_workers;
 
+    /*
+     * Custom parallel contexts consume slots from max_worker_processes, not
+     * from the per-query max_parallel_workers allowance; clamp to both.
+     */
+    if (workers > max_worker_processes)
+        workers = max_worker_processes;
+
     /* Parallel workers cannot launch nested parallel workers. */
     if (IsInParallelMode())
         return 0;
@@ -219,17 +228,6 @@ pg_checksums_get_snapshot(void)
  * Internal type definitions
  *-------------------------------------------------------------------------
  */
-
-/* Structure for index logical checksum entries */
-typedef struct IndexLogicalEntry
-{
-    Datum       *key_values;      /* Array of index key values */
-    bool        *key_nulls;       /* Array of null flags */
-    uint32      *key_hashes;      /* Array of precomputed key hashes */
-    int         nkeys;            /* Number of key columns */
-    ItemPointerData tid;          /* Heap tuple ID */
-    uint32      entry_hash;       /* Precomputed hash of this entry */
-} IndexLogicalEntry;
 
 /*-------------------------------------------------------------------------
  * Order-independent aggregation state
@@ -269,13 +267,15 @@ typedef struct ChecksumAccum64
  * no streaming or variable-sized shared memory is required. For 32-bit
  * scans partial holds the uint32 aggregate zero-extended to 64 bits.
  * found_invalid is set only by logical table scans to report a tuple with
- * a NULL primary key value.
+ * a NULL primary key value.  had_error is set by database scans when one or
+ * more relations had to be skipped.
  */
 typedef struct ChecksumWorkerResult
 {
     uint64      partial;
     uint64      count;
     bool        found_invalid;
+    bool        had_error;
 } ChecksumWorkerResult;
 
 /*
@@ -336,6 +336,7 @@ static uint32 pg_tuple_logical_checksum_internal(Relation rel, HeapTuple tuple,
                                                  bool include_header,
                                                  List *pk_columns);
 static bool index_supports_checksum(Oid amoid);
+static bool index_supports_logical_checksum(Oid amoid);
 static uint32 pg_cell_checksum_internal(Datum value, bool isnull, Oid typid,
                                           int16 typlen, bool typbyval,
                                           int attnum);
@@ -344,9 +345,39 @@ static uint64 compute_database_checksum_internal(bool physical, bool include_sys
 static uint32 compute_typlen_byval_checksum(Datum value, Oid typid, int len, int attnum);
 static uint32 compute_checksum_for_data(const char *data, int len, int attnum);
 static uint32 pg_checksum_data_custom(const char *data, uint32 len, uint32 init_value);
-static uint32 pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum, 
-                                                  BlockNumber blkno, bool include_header);
+static uint32 pg_tuple_physical_checksum_internal(Relation rel, Page page,
+                                                  OffsetNumber offnum,
+                                                  BlockNumber blkno,
+                                                  bool include_header);
 static uint32 combine_checksums(uint32 current, uint32 new_val);
+
+/* Privilege, relkind and storage validation helpers */
+static void pg_checksums_require_select(Oid reloid);
+static void pg_checksums_check_relation_kind(Relation rel, bool allow_toast,
+                                             bool allow_partitioned);
+static bool pg_checksums_relation_has_storage(Relation rel);
+static bool pg_checksums_page_header_sane(Page page);
+static void pg_checksums_check_page(Relation rel, BlockNumber blkno, Page page);
+static bool pg_checksums_item_is_sane(Page page, ItemId lp);
+static void pg_checksums_check_heap_tuple(Relation rel, BlockNumber blkno,
+                                         OffsetNumber offnum,
+                                         HeapTupleHeader tuple, Size len);
+static void scan_relation_raw_pages(Relation rel, BlockNumber start,
+                                    BlockNumber end, ChecksumAccum *acc);
+
+/* Table checksum implementations (shared by the SQL wrappers and partitions) */
+static uint64 pg_table_physical_checksum_calc(Oid reloid, bool include_header,
+                                              bool check_privileges);
+static int64 pg_table_logical_checksum_calc(Oid reloid, bool check_privileges,
+                                            bool *is_null);
+
+/* Index checksum implementations (shared with the database scan) */
+static uint32 pg_index_physical_checksum_calc(Oid indexoid,
+                                              bool check_privileges,
+                                              bool *is_null);
+static uint32 pg_index_logical_checksum_calc(Oid indexoid,
+                                             bool check_privileges,
+                                             bool *is_null);
 
 static uint32 hash_mix32(uint32 h);
 static uint64 hash_mix64(uint64 h);
@@ -371,7 +402,7 @@ static void scan_index_blocks_logical(Relation idxRel, BlockNumber start,
                                       BlockNumber end, ChecksumAccum *acc);
 static void compute_database_items(ChecksumRelationItem *items, uint32 start,
                                    uint32 end, bool physical,
-                                   ChecksumAccum64 *acc);
+                                   ChecksumAccum64 *acc, bool *had_error);
 
 static void pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type,
                                               Oid reloid, bool include_header,
@@ -383,7 +414,8 @@ static void pg_checksums_parallel_scan_database(bool physical,
                                                 bool include_toast,
                                                 ChecksumRelationItem *items,
                                                 uint32 nitems, int workers,
-                                                ChecksumAccum64 *acc);
+                                                ChecksumAccum64 *acc,
+                                                bool *had_error);
 
 /* Parallel worker entry point (must be a globally visible symbol). */
 PGDLLEXPORT void pg_checksums_parallel_worker_main(dsm_segment *seg, shm_toc *toc);
@@ -631,6 +663,261 @@ checksum_accum64_finalize(ChecksumAccum64 *acc)
 }
 
 /*-------------------------------------------------------------------------
+ * Privilege, relkind and storage validation helpers
+ *-------------------------------------------------------------------------
+ */
+
+/*
+ * pg_checksums_require_select - enforce SELECT privilege and RLS
+ *
+ * The checksum functions read relation storage directly, without going
+ * through the executor.  They must therefore perform the same privilege
+ * check the executor would perform, and they cannot apply row-level
+ * security policies: a relation protected by RLS must be rejected rather
+ * than scanned behind the policy's back.
+ *
+ * Indexes carry no ACL of their own, so the privilege check for an index
+ * is performed on the underlying heap relation.
+ */
+static void
+pg_checksums_require_select(Oid reloid)
+{
+    Oid         acl_relid = reloid;
+    char        relkind = get_rel_relkind(reloid);
+    AclResult   aclresult;
+    ObjectType  objtype = OBJECT_TABLE;
+    char       *relname;
+
+    if (relkind == RELKIND_INDEX || relkind == RELKIND_PARTITIONED_INDEX)
+        acl_relid = IndexGetRelation(reloid, false);
+
+    aclresult = pg_class_aclcheck(acl_relid, GetUserId(), ACL_SELECT);
+    if (aclresult != ACLCHECK_OK)
+    {
+        relname = get_rel_name(acl_relid);
+        if (relname == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_TABLE),
+                     errmsg("relation with OID %u does not exist", acl_relid)));
+
+        if (get_rel_relkind(acl_relid) == RELKIND_SEQUENCE)
+            objtype = OBJECT_SEQUENCE;
+        aclcheck_error(aclresult, objtype, relname);
+    }
+
+    /*
+     * check_enable_rls() accounts for superusers, roles with BYPASSRLS and
+     * table owners (including FORCE ROW LEVEL SECURITY).
+     */
+    if (check_enable_rls(acl_relid, GetUserId(), true) == RLS_ENABLED)
+    {
+        relname = get_rel_name(acl_relid);
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("cannot compute checksum of relation \"%s\" because row-level security is enabled",
+                        relname ? relname : "?"),
+                 errhint("Use a role with BYPASSRLS, the table owner, or disable RLS for this operation.")));
+    }
+}
+
+/*
+ * pg_checksums_check_relation_kind - reject relations we cannot checksum
+ * with the heap tuple routines.
+ */
+static void
+pg_checksums_check_relation_kind(Relation rel, bool allow_toast,
+                                 bool allow_partitioned)
+{
+    char        relkind = rel->rd_rel->relkind;
+
+    if (relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW)
+        return;
+
+    if (relkind == RELKIND_PARTITIONED_TABLE)
+    {
+        if (allow_partitioned)
+            return;
+
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                 errmsg("partitioned table \"%s\" has no storage of its own",
+                        RelationGetRelationName(rel))));
+    }
+
+    if (relkind == RELKIND_TOASTVALUE)
+    {
+        if (allow_toast)
+            return;
+
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                 errmsg("TOAST relation \"%s\" is not a heap relation",
+                        RelationGetRelationName(rel))));
+    }
+
+    switch (relkind)
+    {
+        case RELKIND_INDEX:
+        case RELKIND_PARTITIONED_INDEX:
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("relation \"%s\" is an index, not a table",
+                            RelationGetRelationName(rel))));
+            break;
+        case RELKIND_SEQUENCE:
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("relation \"%s\" is a sequence, not a table",
+                            RelationGetRelationName(rel))));
+            break;
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("relation \"%s\" is not a table with storage",
+                            RelationGetRelationName(rel))));
+            break;
+    }
+}
+
+/*
+ * pg_checksums_relation_has_storage - can pg_page_checksum() read pages?
+ */
+static bool
+pg_checksums_relation_has_storage(Relation rel)
+{
+    switch (rel->rd_rel->relkind)
+    {
+        case RELKIND_RELATION:
+        case RELKIND_MATVIEW:
+        case RELKIND_INDEX:
+        case RELKIND_SEQUENCE:
+        case RELKIND_TOASTVALUE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * pg_checksums_page_header_sane - cheap structural validation of a page
+ *
+ * This mirrors the header checks of PageIsVerified(), without the checksum
+ * part.  It is used before following line pointers, so that a corrupted
+ * page produces a clean error instead of crashing the backend that is
+ * supposed to detect the corruption.
+ */
+static bool
+pg_checksums_page_header_sane(Page page)
+{
+    PageHeader  phdr = (PageHeader) page;
+
+    return (phdr->pd_flags & ~PD_VALID_FLAG_BITS) == 0 &&
+        phdr->pd_lower >= SizeOfPageHeaderData &&
+        phdr->pd_lower <= phdr->pd_upper &&
+        phdr->pd_upper <= phdr->pd_special &&
+        phdr->pd_special <= BLCKSZ &&
+        phdr->pd_special == MAXALIGN(phdr->pd_special);
+}
+
+/*
+ * pg_checksums_check_page - raise a clean error for an insane page header
+ */
+static void
+pg_checksums_check_page(Relation rel, BlockNumber blkno, Page page)
+{
+    if (PageIsNew(page))
+        return;
+
+    if (!pg_checksums_page_header_sane(page))
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("corrupt page header in relation \"%s\" at block %u",
+                        RelationGetRelationName(rel), blkno)));
+}
+
+/*
+ * pg_checksums_item_is_sane - validate an item pointer against the page
+ *
+ * Besides ItemIdIsNormal(), check that the tuple lies between pd_upper and
+ * pd_special and that its length does not run past the end of that area.
+ */
+static bool
+pg_checksums_item_is_sane(Page page, ItemId lp)
+{
+    PageHeader  phdr = (PageHeader) page;
+    char       *item;
+    Size        len;
+
+    if (!ItemIdIsNormal(lp))
+        return false;
+
+    len = ItemIdGetLength(lp);
+    item = (char *) PageGetItem(page, lp);
+
+    if (item < (char *) page + phdr->pd_upper)
+        return false;
+    if (item + len > (char *) page + phdr->pd_special)
+        return false;
+
+    return true;
+}
+
+/*
+ * pg_checksums_check_heap_tuple - validate the parts of a heap tuple header
+ * that the checksum routines are about to follow.
+ */
+static void
+pg_checksums_check_heap_tuple(Relation rel, BlockNumber blkno,
+                              OffsetNumber offnum, HeapTupleHeader tuple,
+                              Size len)
+{
+    if (len < SizeofHeapTupleHeader ||
+        tuple->t_hoff < SizeofHeapTupleHeader ||
+        tuple->t_hoff > len)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("corrupt tuple header in relation \"%s\" at block %u, offset %u",
+                        RelationGetRelationName(rel), blkno, offnum)));
+}
+
+/*
+ * scan_relation_raw_pages - checksum a relation as a sequence of raw pages
+ *
+ * Used for TOAST relations, whose tuples are not HeapTupleHeader structures
+ * and therefore cannot go through the regular heap tuple path.
+ */
+static void
+scan_relation_raw_pages(Relation rel, BlockNumber start, BlockNumber end,
+                        ChecksumAccum *acc)
+{
+    BlockNumber blkno;
+    BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
+
+    for (blkno = start; blkno < end; blkno++)
+    {
+        Buffer      buffer;
+        Page        page;
+        uint32      page_hash;
+
+        buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+                                    bstrategy);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+
+        page_hash = fnv1a_32_hash((const unsigned char *) page, BLCKSZ, 0);
+        page_hash = combine_checksums(page_hash, blkno);
+        checksum_accum_add(acc, page_hash);
+
+        UnlockReleaseBuffer(buffer);
+
+        if ((blkno & 63) == 0)
+            CHECK_FOR_INTERRUPTS();
+    }
+
+    FreeAccessStrategy(bstrategy);
+}
+
+/*-------------------------------------------------------------------------
  * PAGE LEVEL FUNCTIONS (Physical only)
  *-------------------------------------------------------------------------
  */
@@ -649,38 +936,85 @@ PG_FUNCTION_INFO_V1(pg_page_checksum);
 Datum
 pg_page_checksum(PG_FUNCTION_ARGS)
 {
-    Oid reloid;
-    int32 blkno;
-    Relation rel;
-    Buffer buffer;
-    Page page;
-    uint16 checksum;
-    
-    if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-        PG_RETURN_NULL();
-    
+    Oid         reloid;
+    int32       blkno;
+    Relation    rel;
+    Buffer      buffer;
+    Page        page;
+    BlockNumber nblocks;
+    char       *pagecopy;
+    uint16      checksum;
+
     reloid = PG_GETARG_OID(0);
     blkno = PG_GETARG_INT32(1);
-    
+
     /* Open relation with AccessShareLock to prevent concurrent modifications */
     rel = relation_open(reloid, AccessShareLock);
-    
-    /* Read the page from buffer manager */
-    buffer = ReadBuffer(rel, (BlockNumber)blkno);
+
+    pg_checksums_require_select(reloid);
+
+    if (!pg_checksums_relation_has_storage(rel))
+    {
+        char       *relname = pstrdup(RelationGetRelationName(rel));
+
+        relation_close(rel, AccessShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                 errmsg("relation \"%s\" has no storage", relname)));
+    }
+
+    nblocks = RelationGetNumberOfBlocks(rel);
+
+    /*
+     * BlockNumber is unsigned, and P_NEW (0xFFFFFFFF) is what a negative
+     * int4 turns into.  ReadBuffer(P_NEW) would extend the relation, so the
+     * range must be validated before reading.
+     */
+    if (blkno < 0 || (uint32) blkno >= nblocks)
+    {
+        char       *relname = pstrdup(RelationGetRelationName(rel));
+
+        relation_close(rel, AccessShareLock);
+
+        if (nblocks == 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("relation \"%s\" has no pages", relname)));
+
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("block number %d is out of range for relation \"%s\" (0..%u)",
+                        blkno, relname, nblocks - 1)));
+    }
+
+    /* Read the page from the buffer manager */
+    buffer = ReadBuffer(rel, (BlockNumber) blkno);
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
-    
     page = BufferGetPage(buffer);
-    
-    /* Use built-in pg_checksum_page function */
+
     if (PageIsNew(page))
-        checksum = 0;
-    else
-        checksum = pg_checksum_page((char *)page, (BlockNumber)blkno);
-    
+    {
+        UnlockReleaseBuffer(buffer);
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_INT32(0);
+    }
+
+    /*
+     * pg_checksum_page() transiently zeroes pd_checksum.  It must not run on
+     * a page from the shared buffer pool: a concurrent caller could observe
+     * the zeroed field, and an error between the two stores would leave the
+     * page with a bogus checksum.  Copy the page and compute on the copy.
+     */
+    pagecopy = (char *) palloc(BLCKSZ);
+    memcpy(pagecopy, page, BLCKSZ);
     UnlockReleaseBuffer(buffer);
+
+    checksum = pg_checksum_page(pagecopy, (BlockNumber) blkno);
+
+    pfree(pagecopy);
     relation_close(rel, AccessShareLock);
-    
-    PG_RETURN_INT32((int32)checksum);
+
+    PG_RETURN_INT32((int32) checksum);
 }
 
 /*-------------------------------------------------------------------------
@@ -935,48 +1269,90 @@ pg_cell_checksum(PG_FUNCTION_ARGS)
     HeapTupleData heapTuple;
     TupleDesc   tupdesc;
     Form_pg_attribute attr;
-    uint32      checksum = 0;
-    
+    uint32      checksum;
+    BlockNumber blkno;
+    OffsetNumber offnum;
+    Size        tuple_len;
+
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
         PG_RETURN_NULL();
-    
+
     reloid = PG_GETARG_OID(0);
     tid = PG_GETARG_ITEMPOINTER(1);
     attnum_arg = PG_GETARG_INT32(2);
-    
-    if (attnum_arg <= 0)
+
+    if (attnum_arg <= 0 || !ItemPointerIsValid(tid))
         PG_RETURN_NULL();
-    
+
     /* Open relation and get tuple descriptor */
     rel = relation_open(reloid, AccessShareLock);
+
+    pg_checksums_require_select(reloid);
+    pg_checksums_check_relation_kind(rel, false, false);
+
     tupdesc = RelationGetDescr(rel);
-    
+
     /* Validate attribute number */
     if (attnum_arg > tupdesc->natts)
     {
         relation_close(rel, AccessShareLock);
         PG_RETURN_NULL();
     }
-    
+
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+
+    if (blkno >= RelationGetNumberOfBlocks(rel))
+    {
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
+    }
+
     /* Read the page containing the tuple */
-    buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
+    buffer = ReadBuffer(rel, blkno);
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
     page = BufferGetPage(buffer);
-    lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
-    
-    /* Verify the tuple exists and is valid */
-    if (!ItemIdIsUsed(lp))
+
+    if (PageIsNew(page))
     {
         UnlockReleaseBuffer(buffer);
         relation_close(rel, AccessShareLock);
         PG_RETURN_NULL();
     }
 
+    pg_checksums_check_page(rel, blkno, page);
+
+    if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+    {
+        UnlockReleaseBuffer(buffer);
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
+    }
+
+    lp = PageGetItemId(page, offnum);
+
+    /* Only normal heap tuples carry data; skip dead/redirect/unused items */
+    if (!ItemIdIsNormal(lp))
+    {
+        UnlockReleaseBuffer(buffer);
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
+    }
+
+    if (!pg_checksums_item_is_sane(page, lp))
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("corrupt line pointer in relation \"%s\" at block %u, offset %u",
+                        RelationGetRelationName(rel), blkno, offnum)));
+
     tuple = (HeapTupleHeader) PageGetItem(page, lp);
+    tuple_len = ItemIdGetLength(lp);
+
+    pg_checksums_check_heap_tuple(rel, blkno, offnum, tuple, tuple_len);
 
     /* Create temporary HeapTuple structure for heap_getattr */
-    heapTuple.t_len = ItemIdGetLength(lp);
+    heapTuple.t_len = tuple_len;
     heapTuple.t_data = tuple;
     heapTuple.t_tableOid = reloid;
     heapTuple.t_self = *tid;
@@ -984,7 +1360,7 @@ pg_cell_checksum(PG_FUNCTION_ARGS)
     /* Get attribute value using the tuple descriptor */
     attr = TupleDescAttr(tupdesc, attnum_arg - 1);
     value = heap_getattr(&heapTuple, attnum_arg, tupdesc, &isnull);
-    
+
     /* Compute cell checksum using the internal function */
     checksum = pg_cell_checksum_internal(value, isnull,
                                           attr->atttypid,
@@ -995,7 +1371,7 @@ pg_cell_checksum(PG_FUNCTION_ARGS)
     UnlockReleaseBuffer(buffer);
     relation_close(rel, AccessShareLock);
 
-    PG_RETURN_INT32((int32)checksum);
+    PG_RETURN_INT32((int32) checksum);
 }
 
 /*-------------------------------------------------------------------------
@@ -1019,36 +1395,47 @@ pg_cell_checksum(PG_FUNCTION_ARGS)
  * tuples haven't moved unexpectedly.
  */
 static uint32
-pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum, 
+pg_tuple_physical_checksum_internal(Relation rel, Page page,
+                                   OffsetNumber offnum,
                                    BlockNumber blkno, bool include_header)
 {
     ItemId      lp;
     HeapTupleHeader tuple;
     char       *data;
-    uint32      len;
+    Size        len;
     uint32      checksum;
     uint64      location;
     uint32      location_hash;
     uint32      page_info;
     uint32      mvcc_info;
     uint32      itemid_info;
-    PageHeader phdr = (PageHeader)page;
-    XLogRecPtr  page_lsn;
-    uint32      lsn_hi, lsn_lo;
-    
+
+    if (PageIsNew(page))
+        return 0;
+
+    pg_checksums_check_page(rel, blkno, page);
+
     /* Validate offset number range */
     if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
         return 0;
-    
+
     lp = PageGetItemId(page, offnum);
-    
-    /* Skip unused ItemIds */
-    if (!ItemIdIsUsed(lp))
+
+    /* Only normal heap tuples carry data */
+    if (!ItemIdIsNormal(lp))
         return 0;
-    
+
+    if (!pg_checksums_item_is_sane(page, lp))
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("corrupt line pointer in relation \"%s\" at block %u, offset %u",
+                        RelationGetRelationName(rel), blkno, offnum)));
+
     tuple = (HeapTupleHeader) PageGetItem(page, lp);
     len = ItemIdGetLength(lp);
-    
+
+    pg_checksums_check_heap_tuple(rel, blkno, offnum, tuple, len);
+
     if (include_header)
     {
         /* Include entire tuple (header + data) in checksum */
@@ -1059,9 +1446,6 @@ pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum,
         /* Skip header, checksum only the tuple data */
         data = (char *) tuple + tuple->t_hoff;
         len -= tuple->t_hoff;
-        
-        if (len <= 0)
-            return 0;
     }
 
     /* Create 64-bit location from block number and offset */
@@ -1070,21 +1454,29 @@ pg_tuple_physical_checksum_internal(Page page, OffsetNumber offnum,
     /* Calculate 32-bit hash of the location */
     location_hash = fnv1a_32_hash(&location, sizeof(location), FNV_BASIS_32);
     
-    /* Include page header information for additional uniqueness */
+    /*
+     * Include relation identity and storage identity.  relfilenode changes
+     * when VACUUM FULL, CLUSTER or ALTER TABLE SET TABLESPACE rewrite the
+     * relation, so a tuple that happens to land at the same (block, offset)
+     * still has a different physical checksum.  The relation OID keeps
+     * checksums from different relations distinct.
+     */
+    location_hash = combine_checksums(location_hash,
+                                      (uint32) RelationGetRelid(rel));
+    location_hash = combine_checksums(location_hash,
+                                      (uint32) rel->rd_rel->relfilenode);
+    location_hash = combine_checksums(location_hash,
+                                      (uint32) rel->rd_rel->reltablespace);
+
+    /*
+     * Include the page size/layout version for additional uniqueness.  Do
+     * not include the page LSN, pd_checksum or pd_flags: they change when a
+     * concurrent scan sets hint bits, which made a physical checksum depend
+     * on who happened to read the page first.
+     */
     page_info = PageGetPageSize(page) | (PageGetPageLayoutVersion(page) << 16);
     location_hash = combine_checksums(location_hash, page_info);
-    
-    /* Include Page LSN (64-bit) split into two 32-bit parts */
-    page_lsn = PageGetLSN(page); 
-    lsn_hi = (uint32)(page_lsn >> 32);
-    lsn_lo = (uint32)(page_lsn & 0xFFFFFFFF);
-    location_hash = combine_checksums(location_hash, lsn_hi);
-    location_hash = combine_checksums(location_hash, lsn_lo);
-    
-    /* Include other page metadata */
-    location_hash = combine_checksums(location_hash, phdr->pd_checksum);
-    location_hash = combine_checksums(location_hash, phdr->pd_flags);
-    
+
     /* Calculate checksum using location_hash as the initial value */
     checksum = pg_checksum_data_custom(data, len, location_hash);
     
@@ -1124,55 +1516,67 @@ pg_tuple_physical_checksum(PG_FUNCTION_ARGS)
     Oid         reloid;
     ItemPointer tid;
     bool        include_header;
-    Relation    rel = NULL;
-    Buffer      buffer = InvalidBuffer;
+    Relation    rel;
+    volatile Buffer buffer = InvalidBuffer;
     Page        page;
-    uint32      checksum = 0;
-    bool        lock_held = false;
-    
+    volatile uint32 checksum = 0;
+    volatile bool lock_held = false;
+    BlockNumber blkno;
+    OffsetNumber offnum;
+
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
         PG_RETURN_NULL();
-    
+
     reloid = PG_GETARG_OID(0);
     tid = PG_GETARG_ITEMPOINTER(1);
     include_header = PG_GETARG_BOOL(2);
-    
+
+    if (!ItemPointerIsValid(tid))
+        PG_RETURN_NULL();
+
+    rel = relation_open(reloid, AccessShareLock);
+
+    pg_checksums_require_select(reloid);
+    pg_checksums_check_relation_kind(rel, false, false);
+
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+
+    if (blkno >= RelationGetNumberOfBlocks(rel))
+    {
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
+    }
+
     PG_TRY();
     {
-        /* Open relation */
-        rel = relation_open(reloid, AccessShareLock);
-        
         /* Read the page */
-        buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
+        buffer = ReadBuffer(rel, blkno);
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         lock_held = true;
-        
+
         page = BufferGetPage(buffer);
-        
+
         /* Compute tuple checksum */
-        checksum = pg_tuple_physical_checksum_internal(page,
-                                                      ItemPointerGetOffsetNumber(tid),
-                                                      ItemPointerGetBlockNumber(tid),
-                                                      include_header);
+        checksum = pg_tuple_physical_checksum_internal(rel, page, offnum,
+                                                      blkno, include_header);
     }
     PG_CATCH();
     {
         /* Clean up resources in case of error */
         if (lock_held && BufferIsValid(buffer))
             UnlockReleaseBuffer(buffer);
-        if (rel)
-            relation_close(rel, AccessShareLock);
+        relation_close(rel, AccessShareLock);
         PG_RE_THROW();
     }
     PG_END_TRY();
-    
+
     /* Clean up */
     if (lock_held && BufferIsValid(buffer))
         UnlockReleaseBuffer(buffer);
-    if (rel)
-        relation_close(rel, AccessShareLock);
-    
-    PG_RETURN_INT32((int32)checksum);
+    relation_close(rel, AccessShareLock);
+
+    PG_RETURN_INT32((int32) checksum);
 }
 
 /*-------------------------------------------------------------------------
@@ -1353,55 +1757,110 @@ pg_tuple_logical_checksum(PG_FUNCTION_ARGS)
     Oid         reloid;
     ItemPointer tid;
     bool        include_header;
-    Relation    rel = NULL;
-    Buffer      buffer = InvalidBuffer;
+    Relation    rel;
+    volatile Buffer buffer = InvalidBuffer;
     Page        page;
     ItemId      lp;
     HeapTupleData heapTuple;
+    HeapTupleHeader tuple;
     List       *pk_columns;
-    uint32      checksum = 0;
-    bool        lock_held = false;
-    
+    volatile uint32 checksum = 0;
+    volatile bool lock_held = false;
+    volatile bool missing = false;
+    BlockNumber blkno;
+    OffsetNumber offnum;
+    Size        tuple_len;
+
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
         PG_RETURN_NULL();
-    
+
     reloid = PG_GETARG_OID(0);
     tid = PG_GETARG_ITEMPOINTER(1);
     include_header = PG_ARGISNULL(2) ? false : PG_GETARG_BOOL(2);
-    
-    /* Determine the key columns before taking any lock on the relation. */
-    pk_columns = find_primary_key_columns(reloid);
+
+    if (!ItemPointerIsValid(tid))
+        PG_RETURN_NULL();
 
     /* Open relation */
     rel = relation_open(reloid, AccessShareLock);
-    
+
+    pg_checksums_require_select(reloid);
+    pg_checksums_check_relation_kind(rel, true, false);
+
+    /*
+     * A TOAST relation has no primary key and its tuples are not heap tuples;
+     * its logical content is already covered when the parent table detoasts
+     * the values.
+     */
+    if (rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+    {
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
+    }
+
+    /* Determine the key columns before taking any lock on the relation. */
+    pk_columns = find_primary_key_columns(reloid);
+
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+
+    if (blkno >= RelationGetNumberOfBlocks(rel))
+    {
+        list_free(pk_columns);
+        relation_close(rel, AccessShareLock);
+        PG_RETURN_NULL();
+    }
+
     PG_TRY();
     {
         /* Read page */
-        buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
+        buffer = ReadBuffer(rel, blkno);
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         lock_held = true;
-        
+
         page = BufferGetPage(buffer);
-        lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
-        
-        if (!ItemIdIsUsed(lp))
+
+        if (PageIsNew(page))
+            missing = true;
+        else
         {
-            UnlockReleaseBuffer(buffer);
-            list_free(pk_columns);
-            relation_close(rel, AccessShareLock);
-            PG_RETURN_NULL();
+            pg_checksums_check_page(rel, blkno, page);
+
+            if (offnum < FirstOffsetNumber ||
+                offnum > PageGetMaxOffsetNumber(page))
+                missing = true;
+            else
+            {
+                lp = PageGetItemId(page, offnum);
+
+                if (!ItemIdIsNormal(lp))
+                    missing = true;
+                else if (!pg_checksums_item_is_sane(page, lp))
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("corrupt line pointer in relation \"%s\" at block %u, offset %u",
+                                    RelationGetRelationName(rel), blkno, offnum)));
+                else
+                {
+                    tuple = (HeapTupleHeader) PageGetItem(page, lp);
+                    tuple_len = ItemIdGetLength(lp);
+
+                    pg_checksums_check_heap_tuple(rel, blkno, offnum, tuple,
+                                                  tuple_len);
+
+                    /* Create temporary HeapTuple structure */
+                    heapTuple.t_len = tuple_len;
+                    heapTuple.t_data = tuple;
+                    heapTuple.t_tableOid = reloid;
+                    heapTuple.t_self = *tid;
+
+                    /* Compute logical checksum */
+                    checksum = pg_tuple_logical_checksum_internal(rel, &heapTuple,
+                                                                  include_header,
+                                                                  pk_columns);
+                }
+            }
         }
-        
-        /* Create temporary HeapTuple structure */
-        heapTuple.t_len = ItemIdGetLength(lp);
-        heapTuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-        heapTuple.t_tableOid = reloid;
-        heapTuple.t_self = *tid;
-        
-        /* Compute logical checksum */
-        checksum = pg_tuple_logical_checksum_internal(rel, &heapTuple, include_header,
-                                                      pk_columns);
     }
     PG_CATCH();
     {
@@ -1412,16 +1871,16 @@ pg_tuple_logical_checksum(PG_FUNCTION_ARGS)
         PG_RE_THROW();
     }
     PG_END_TRY();
-    
+
     list_free(pk_columns);
     if (lock_held && BufferIsValid(buffer))
         UnlockReleaseBuffer(buffer);
     relation_close(rel, AccessShareLock);
-    
-    if (checksum == 0)
+
+    if (missing || checksum == 0)
         PG_RETURN_NULL();
-    
-    PG_RETURN_INT32((int32)checksum);
+
+    PG_RETURN_INT32((int32) checksum);
 }
 
 /*-------------------------------------------------------------------------
@@ -1458,6 +1917,8 @@ pg_checksums_leaf_partitions(Oid reloid)
             leaves = lappend_oid(leaves, childoid);
     }
 
+    list_free(children);
+
     return leaves;
 }
 
@@ -1486,6 +1947,30 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
 {
     Oid         reloid;
     bool        include_header;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    reloid = PG_GETARG_OID(0);
+    include_header = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
+
+    PG_RETURN_INT64((int64)
+                    pg_table_physical_checksum_calc(reloid, include_header,
+                                                    true));
+}
+
+/*
+ * pg_table_physical_checksum_calc - implementation shared with partitions
+ *
+ * check_privileges is false for leaf partitions reached through a
+ * partitioned table: PostgreSQL checks the privilege on the parent when a
+ * partitioned table is queried, and requiring SELECT on every partition
+ * would reject perfectly valid calls.
+ */
+static uint64
+pg_table_physical_checksum_calc(Oid reloid, bool include_header,
+                                bool check_privileges)
+{
     Relation    rel;
     ChecksumAccum acc = {0, 0};
     uint32      aggregate;
@@ -1493,15 +1978,13 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
     uint32      relation_hash;
     uint32      nblocks;
     int         workers;
-    
-    if (PG_ARGISNULL(0))
-        PG_RETURN_NULL();
-    
-    reloid = PG_GETARG_OID(0);
-    include_header = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
-    
-    /* Open relation */
+
     rel = relation_open(reloid, AccessShareLock);
+
+    if (check_privileges)
+        pg_checksums_require_select(reloid);
+
+    pg_checksums_check_relation_kind(rel, true, true);
 
     /*
      * A partitioned table has no storage of its own: its data lives in the
@@ -1519,38 +2002,74 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
             Oid         partoid = lfirst_oid(lc);
             uint64      part_checksum;
 
-            part_checksum = DatumGetInt64(
-                DirectFunctionCall2(pg_table_physical_checksum,
-                                    ObjectIdGetDatum(partoid),
-                                    BoolGetDatum(include_header)));
+            part_checksum = pg_table_physical_checksum_calc(partoid,
+                                                            include_header,
+                                                            false);
 
             checksum_accum64_add(&acc64,
                                  combine_checksums_64(part_checksum,
                                                       (uint64) partoid));
         }
 
+        list_free(parts);
         relation_close(rel, AccessShareLock);
 
         final_checksum = checksum_accum64_finalize(&acc64);
         final_checksum = combine_checksums_64(final_checksum, (uint64) reloid);
 
-        PG_RETURN_INT64((int64) final_checksum);
+        return final_checksum;
     }
-    
-    /* Include relation metadata in checksum */
+
+    /*
+     * TOAST tuples are not HeapTupleHeader structures.  Checksum the raw
+     * pages of a TOAST relation instead of trying to interpret them as heap
+     * tuples.
+     */
+    if (rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+    {
+        nblocks = RelationGetNumberOfBlocks(rel);
+        scan_relation_raw_pages(rel, 0, nblocks, &acc);
+
+        aggregate = checksum_accum_finalize(&acc);
+
+        if (aggregate == FNV_BASIS_32)
+            aggregate = fnv1a_32_hash(&reloid, sizeof(reloid), FNV_BASIS_32);
+
+        if (aggregate == 0)
+            aggregate = 0x7FFFFFFF;
+
+        aggregate = combine_checksums(aggregate,
+                                      (uint32) rel->rd_rel->relfilenode);
+        aggregate = combine_checksums(aggregate,
+                                      (uint32) rel->rd_rel->reltablespace);
+
+        relation_close(rel, AccessShareLock);
+
+        return ((uint64) aggregate << 32) | reloid;
+    }
+
+    /*
+     * Include the relation and storage identity (but not relpages/reltuples:
+     * planner statistics are not part of the physical data and ANALYZE must
+     * not change the checksum).  relfilenode changes on VACUUM FULL, CLUSTER
+     * and SET TABLESPACE, so even an empty rewritten table gets a new
+     * checksum.
+     */
     relation_hash = fnv1a_32_hash(&reloid, sizeof(reloid), FNV_BASIS_32);
-    relation_hash = combine_checksums(relation_hash, rel->rd_rel->relpages);
-    relation_hash = combine_checksums(relation_hash, rel->rd_rel->reltuples);
-    
+    relation_hash = combine_checksums(relation_hash,
+                                      (uint32) rel->rd_rel->relfilenode);
+    relation_hash = combine_checksums(relation_hash,
+                                      (uint32) rel->rd_rel->reltablespace);
+
     nblocks = RelationGetNumberOfBlocks(rel);
     workers = pg_checksums_worker_count();
-    if (workers > (int) nblocks)
+    if (nblocks < (uint32) workers)
         workers = (int) nblocks;
-    
+
     if (workers < 1)
     {
         Snapshot    snapshot = pg_checksums_get_snapshot();
-        
+
         scan_table_blocks_physical(rel, 0, nblocks, include_header,
                                    snapshot, &acc);
     }
@@ -1560,28 +2079,28 @@ pg_table_physical_checksum(PG_FUNCTION_ARGS)
                                           reloid, include_header, nblocks,
                                           workers, &acc, NULL);
     }
-    
+
     relation_close(rel, AccessShareLock);
-    
+
     /* Compute order-independent aggregate */
     aggregate = checksum_accum_finalize(&acc);
-    
+
     /* Combine with relation metadata */
     aggregate = combine_checksums(aggregate, relation_hash);
-    
-    if (aggregate == FNV_BASIS_32) {
+
+    if (aggregate == FNV_BASIS_32)
+    {
         /* Guarantee hash for empty tables */
         aggregate = fnv1a_32_hash(&reloid, sizeof(reloid), FNV_BASIS_32);
     }
 
-    if (aggregate == 0) {
+    if (aggregate == 0)
         aggregate = 0x7FFFFFFF;
-    }
-    
+
     /* Combine aggregate hash (upper 32 bits) with OID (lower 32 bits) */
-    final_checksum = ((uint64)aggregate << 32) | reloid;
-    
-    PG_RETURN_INT64((int64)final_checksum);
+    final_checksum = ((uint64) aggregate << 32) | reloid;
+
+    return final_checksum;
 }
 
 /*
@@ -1600,6 +2119,32 @@ Datum
 pg_table_logical_checksum(PG_FUNCTION_ARGS)
 {
     Oid         reloid;
+    bool        is_null = false;
+    int64       result;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    reloid = PG_GETARG_OID(0);
+
+    result = pg_table_logical_checksum_calc(reloid, true, &is_null);
+
+    if (is_null)
+        PG_RETURN_NULL();
+
+    PG_RETURN_INT64(result);
+}
+
+/*
+ * pg_table_logical_checksum_calc - implementation shared with partitions
+ *
+ * Sets *is_null when the checksum is undefined (no primary key, a NULL key
+ * value, or a TOAST relation).
+ */
+static int64
+pg_table_logical_checksum_calc(Oid reloid, bool check_privileges,
+                               bool *is_null)
+{
     Relation    rel;
     ChecksumAccum acc = {0, 0};
     List       *pk_columns;
@@ -1608,14 +2153,27 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
     bool        found_invalid = false;
     uint32      nblocks;
     int         workers;
-    
-    if (PG_ARGISNULL(0))
-        PG_RETURN_NULL();
-    
-    reloid = PG_GETARG_OID(0);
-    
-    /* Open relation */
+
+    *is_null = false;
+
     rel = relation_open(reloid, AccessShareLock);
+
+    if (check_privileges)
+        pg_checksums_require_select(reloid);
+
+    pg_checksums_check_relation_kind(rel, true, true);
+
+    /*
+     * A TOAST relation has no primary key, and its tuples are not heap
+     * tuples.  Its logical content is already covered when the parent table
+     * detoasts the values.
+     */
+    if (rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+    {
+        relation_close(rel, AccessShareLock);
+        *is_null = true;
+        return 0;
+    }
 
     /*
      * A partitioned table has no storage of its own. Check the primary key
@@ -1632,9 +2190,9 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
         pk_columns = find_primary_key_columns(reloid);
         if (pk_columns == NIL)
         {
-            list_free(pk_columns);
             relation_close(rel, AccessShareLock);
-            PG_RETURN_NULL();
+            *is_null = true;
+            return 0;
         }
         list_free(pk_columns);
 
@@ -1643,49 +2201,53 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
         foreach(lc, parts)
         {
             Oid         partoid = lfirst_oid(lc);
-            Datum       d = DirectFunctionCall1(pg_table_logical_checksum,
-                                                ObjectIdGetDatum(partoid));
+            bool        part_null = false;
+            int64       part_checksum;
 
-            if (DatumGetPointer(d) == NULL)
+            part_checksum = pg_table_logical_checksum_calc(partoid, false,
+                                                           &part_null);
+
+            if (part_null)
                 any_null = true;
             else
-            {
-                uint64      part_checksum = DatumGetInt64(d);
-
                 checksum_accum64_add(&acc64,
-                                     combine_checksums_64(part_checksum,
+                                     combine_checksums_64((uint64) part_checksum,
                                                           (uint64) partoid));
-            }
         }
 
+        list_free(parts);
         relation_close(rel, AccessShareLock);
 
         if (any_null)
-            PG_RETURN_NULL();
+        {
+            *is_null = true;
+            return 0;
+        }
 
         final_checksum = checksum_accum64_finalize(&acc64);
         final_checksum = combine_checksums_64(final_checksum, (uint64) reloid);
 
-        PG_RETURN_INT64((int64) final_checksum);
+        return (int64) final_checksum;
     }
-    
+
     /* Check for primary key */
     pk_columns = find_primary_key_columns(reloid);
     if (pk_columns == NIL)
     {
         relation_close(rel, AccessShareLock);
-        PG_RETURN_NULL();
+        *is_null = true;
+        return 0;
     }
-    
+
     nblocks = RelationGetNumberOfBlocks(rel);
     workers = pg_checksums_worker_count();
-    if (workers > (int) nblocks)
+    if (nblocks < (uint32) workers)
         workers = (int) nblocks;
-    
+
     if (workers < 1)
     {
         Snapshot    snapshot = pg_checksums_get_snapshot();
-        
+
         scan_table_blocks_logical(rel, 0, nblocks, snapshot, pk_columns,
                                   &acc, &found_invalid);
     }
@@ -1695,21 +2257,24 @@ pg_table_logical_checksum(PG_FUNCTION_ARGS)
                                           reloid, false, nblocks,
                                           workers, &acc, &found_invalid);
     }
-    
+
     list_free(pk_columns);
     relation_close(rel, AccessShareLock);
-    
+
     /* A NULL primary key value makes the logical checksum undefined. */
     if (found_invalid)
-        PG_RETURN_NULL();
-    
+    {
+        *is_null = true;
+        return 0;
+    }
+
     /* Compute order-independent aggregate */
     aggregate = checksum_accum_finalize(&acc);
-    
+
     /* Combine with relation OID for uniqueness */
-    final_checksum = ((uint64)aggregate << 32) | reloid;
-    
-    PG_RETURN_INT64((int64)final_checksum);
+    final_checksum = ((uint64) aggregate << 32) | reloid;
+
+    return (int64) final_checksum;
 }
 
 /*-------------------------------------------------------------------------
@@ -1739,6 +2304,22 @@ index_supports_checksum(Oid amoid)
             amoid == BRIN_AM_OID);
 }
 
+/*
+ * index_supports_logical_checksum - AMs whose pages contain ordinary
+ * (key, TID) index tuples that can be deformed safely.
+ *
+ * Only B-tree is supported for logical checksums.  The other supported AMs
+ * (Hash, GiST, GIN, SP-GiST, BRIN) use their own page formats: deforming
+ * their page items as index tuples produces garbage, and on SP-GiST it
+ * crashes the backend.  Physical checksums only hash raw pages, so they
+ * remain available for all of them.
+ */
+static bool
+index_supports_logical_checksum(Oid amoid)
+{
+    return amoid == BTREE_AM_OID;
+}
+
 
 /*-------------------------------------------------------------------------
  * Physical Index Checksum Functions
@@ -1749,10 +2330,9 @@ index_supports_checksum(Oid amoid)
  * pg_index_physical_checksum - SQL function for physical index checksums
  *
  * Public interface for computing physical index checksums.
- * Supports all major index types. Returns NULL for unsupported
- * index types.
- *
- * For empty indexes, returns a hash of the relation OID.
+ * Supports all major index types. Returns NULL for unsupported index types
+ * and for partitioned indexes.  Empty indexes are still distinguished by
+ * their relation and storage identity.
  */
 PG_FUNCTION_INFO_V1(pg_index_physical_checksum);
 
@@ -1760,6 +2340,31 @@ Datum
 pg_index_physical_checksum(PG_FUNCTION_ARGS)
 {
     Oid         indexoid;
+    bool        is_null = false;
+    uint32      index_checksum;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    indexoid = PG_GETARG_OID(0);
+
+    index_checksum = pg_index_physical_checksum_calc(indexoid, true, &is_null);
+
+    if (is_null)
+        PG_RETURN_NULL();
+
+    PG_RETURN_INT32((int32) index_checksum);
+}
+
+/*
+ * pg_index_physical_checksum_calc - implementation shared with database scan
+ *
+ * Sets *is_null for unsupported access methods and partitioned indexes.
+ */
+static uint32
+pg_index_physical_checksum_calc(Oid indexoid, bool check_privileges,
+                                bool *is_null)
+{
     Relation    idxRel;
     ChecksumAccum acc = {0, 0};
     uint32      index_checksum = 0;
@@ -1767,55 +2372,74 @@ pg_index_physical_checksum(PG_FUNCTION_ARGS)
     bool        is_brin;
     uint32      nblocks;
     int         workers;
-    
-    if (PG_ARGISNULL(0))
-        PG_RETURN_NULL();
-    
-    indexoid = PG_GETARG_OID(0);
-    
+
+    *is_null = false;
+
     /* Open index */
     idxRel = index_open(indexoid, AccessShareLock);
-    
+
+    /* Indexes derive their ACL from the underlying heap relation. */
+    if (check_privileges)
+        pg_checksums_require_select(indexoid);
+
+    /*
+     * A partitioned index has no storage of its own.  Aggregating the leaf
+     * indexes is a separate feature; do not return a checksum of the empty
+     * parent.
+     */
+    if (idxRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
+    {
+        index_close(idxRel, AccessShareLock);
+        *is_null = true;
+        return 0;
+    }
+
     /* Check index type support */
     if (!index_supports_checksum(idxRel->rd_rel->relam))
     {
         index_close(idxRel, AccessShareLock);
-        PG_RETURN_NULL();  /* Return NULL without warning for unsupported types */
+        *is_null = true;
+        return 0;
     }
-    
+
     is_brin = (idxRel->rd_rel->relam == BRIN_AM_OID);
     nblocks = RelationGetNumberOfBlocks(idxRel);
     workers = pg_checksums_worker_count();
-    if (workers > (int) nblocks)
+    if (nblocks < (uint32) workers)
         workers = (int) nblocks;
-    
+
     if (workers < 1)
         scan_index_blocks_physical(idxRel, 0, nblocks, is_brin, &acc);
     else
         pg_checksums_parallel_scan_blocks(CHECKSUM_TASK_INDEX_PHYSICAL,
                                           indexoid, false, nblocks, workers,
                                           &acc, NULL);
-    
+
     index_checksum = checksum_accum_finalize(&acc);
-    
+
     /* Generic indexes also fold in their access-method metadata. */
     if (!is_brin)
     {
         index_type_hash = fnv1a_32_hash(&idxRel->rd_rel->relam, sizeof(Oid), FNV_BASIS_32);
-        index_type_hash = combine_checksums(index_type_hash, idxRel->rd_rel->relnatts);
+        index_type_hash = combine_checksums(index_type_hash,
+                                            (uint32) idxRel->rd_rel->relnatts);
         index_checksum = combine_checksums(index_checksum, index_type_hash);
     }
-    
+
+    /*
+     * Index rewrites (REINDEX, VACUUM FULL, CLUSTER) assign a new
+     * relfilenode.  Include it so a rebuilt index gets a different physical
+     * checksum even when its pages happen to be byte-identical.
+     */
+    index_checksum = combine_checksums(index_checksum,
+                                       (uint32) idxRel->rd_rel->relfilenode);
+    index_checksum = combine_checksums(index_checksum,
+                                       (uint32) idxRel->rd_rel->reltablespace);
+
     /* Close index */
     index_close(idxRel, AccessShareLock);
-    
-    /* For empty indexes, return hash of relation OID */
-    if (index_checksum == FNV_BASIS_32)
-    {
-        index_checksum = fnv1a_32_hash(&indexoid, sizeof(indexoid), FNV_BASIS_32);
-    }
-    
-    PG_RETURN_INT32((int32)index_checksum);
+
+    return index_checksum;
 }
 
 /*-------------------------------------------------------------------------
@@ -1835,49 +2459,92 @@ Datum
 pg_index_logical_checksum(PG_FUNCTION_ARGS)
 {
     Oid         indexoid;
+    bool        is_null = false;
+    uint32      index_checksum;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    indexoid = PG_GETARG_OID(0);
+
+    index_checksum = pg_index_logical_checksum_calc(indexoid, true, &is_null);
+
+    if (is_null)
+        PG_RETURN_NULL();
+
+    PG_RETURN_INT32((int32) index_checksum);
+}
+
+/*
+ * pg_index_logical_checksum_calc - implementation shared with database scan
+ *
+ * Sets *is_null for unsupported access methods and partitioned indexes.
+ */
+static uint32
+pg_index_logical_checksum_calc(Oid indexoid, bool check_privileges,
+                               bool *is_null)
+{
     Relation    idxRel;
     ChecksumAccum acc = {0, 0};
     uint32      index_checksum = 0;
     uint32      nblocks;
     int         workers;
-    
-    if (PG_ARGISNULL(0))
-        PG_RETURN_NULL();
-    
-    indexoid = PG_GETARG_OID(0);
-    
+
+    *is_null = false;
+
     /* Open index */
     idxRel = index_open(indexoid, AccessShareLock);
-    
-    /* Check index type support */
-    if (!index_supports_checksum(idxRel->rd_rel->relam))
+
+    /* Indexes derive their ACL from the underlying heap relation. */
+    if (check_privileges)
+        pg_checksums_require_select(indexoid);
+
+    /*
+     * A partitioned index has no storage of its own; its leaf indexes are
+     * separate relations.  Do not pretend that the empty parent has a
+     * logical checksum.
+     */
+    if (idxRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
     {
         index_close(idxRel, AccessShareLock);
-        PG_RETURN_NULL(); 
+        *is_null = true;
+        return 0;
     }
-    
+
+    /*
+     * Logical checksums are only meaningful for B-tree pages.  Other AM
+     * page formats cannot be treated as arrays of index tuples (SP-GiST
+     * even crashes); physical checksums remain available for those AMs.
+     */
+    if (!index_supports_logical_checksum(idxRel->rd_rel->relam))
+    {
+        index_close(idxRel, AccessShareLock);
+        *is_null = true;
+        return 0;
+    }
+
     nblocks = RelationGetNumberOfBlocks(idxRel);
     workers = pg_checksums_worker_count();
-    if (workers > (int) nblocks)
+    if (nblocks < (uint32) workers)
         workers = (int) nblocks;
-    
+
     if (workers < 1)
         scan_index_blocks_logical(idxRel, 0, nblocks, &acc);
     else
         pg_checksums_parallel_scan_blocks(CHECKSUM_TASK_INDEX_LOGICAL,
                                           indexoid, false, nblocks, workers,
                                           &acc, NULL);
-    
+
     /* Close index */
     index_close(idxRel, AccessShareLock);
-    
+
     /* Empty indexes hash the relation OID. */
     if (acc.count == 0)
         index_checksum = fnv1a_32_hash(&indexoid, sizeof(indexoid), FNV_BASIS_32);
     else
         index_checksum = checksum_accum_finalize(&acc);
-    
-    PG_RETURN_INT32((int32)index_checksum);
+
+    return index_checksum;
 }
 
 /*-------------------------------------------------------------------------
@@ -1910,7 +2577,16 @@ pg_checksums_consume(ChecksumParallelState *state, uint32 chunk,
         return false;
 
     *start = first;
-    *end = Min(first + chunk, state->nitems);
+
+    /*
+     * Compute the end without first + chunk, which could wrap around for a
+     * relation with close to 2^32 blocks.
+     */
+    if (chunk >= state->nitems - first)
+        *end = state->nitems;
+    else
+        *end = first + chunk;
+
     return true;
 }
 
@@ -1927,6 +2603,7 @@ scan_table_blocks_physical(Relation rel, BlockNumber start, BlockNumber end,
                            ChecksumAccum *acc)
 {
     BlockNumber blkno;
+    BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
 
     for (blkno = start; blkno < end; blkno++)
     {
@@ -1935,9 +2612,20 @@ scan_table_blocks_physical(Relation rel, BlockNumber start, BlockNumber end,
         OffsetNumber maxoff;
         OffsetNumber offnum;
 
-        buffer = ReadBuffer(rel, blkno);
+        buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+                                    bstrategy);
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buffer);
+
+        if (PageIsNew(page))
+        {
+            UnlockReleaseBuffer(buffer);
+            if ((blkno & 63) == 0)
+                CHECK_FOR_INTERRUPTS();
+            continue;
+        }
+
+        pg_checksums_check_page(rel, blkno, page);
 
         maxoff = PageGetMaxOffsetNumber(page);
         for (offnum = FirstOffsetNumber; offnum <= maxoff;
@@ -1946,13 +2634,24 @@ scan_table_blocks_physical(Relation rel, BlockNumber start, BlockNumber end,
             ItemId      lp = PageGetItemId(page, offnum);
             HeapTupleHeader htup;
             HeapTupleData tuple;
+            Size        tuple_len;
             uint32      tuple_checksum;
 
             if (!ItemIdIsNormal(lp))
                 continue;
 
+            if (!pg_checksums_item_is_sane(page, lp))
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_CORRUPTED),
+                         errmsg("corrupt line pointer in relation \"%s\" at block %u, offset %u",
+                                RelationGetRelationName(rel), blkno, offnum)));
+
             htup = (HeapTupleHeader) PageGetItem(page, lp);
-            tuple.t_len = ItemIdGetLength(lp);
+            tuple_len = ItemIdGetLength(lp);
+
+            pg_checksums_check_heap_tuple(rel, blkno, offnum, htup, tuple_len);
+
+            tuple.t_len = tuple_len;
             tuple.t_data = htup;
             tuple.t_tableOid = RelationGetRelid(rel);
             ItemPointerSet(&tuple.t_self, blkno, offnum);
@@ -1960,8 +2659,8 @@ scan_table_blocks_physical(Relation rel, BlockNumber start, BlockNumber end,
             if (!HeapTupleSatisfiesVisibility(&tuple, snapshot, buffer))
                 continue;
 
-            tuple_checksum = pg_tuple_physical_checksum_internal(page, offnum,
-                                                                 blkno,
+            tuple_checksum = pg_tuple_physical_checksum_internal(rel, page,
+                                                                 offnum, blkno,
                                                                  include_header);
             if (tuple_checksum != 0)
                 checksum_accum_add(acc, tuple_checksum);
@@ -1972,6 +2671,8 @@ scan_table_blocks_physical(Relation rel, BlockNumber start, BlockNumber end,
         if ((blkno & 63) == 0)
             CHECK_FOR_INTERRUPTS();
     }
+
+    FreeAccessStrategy(bstrategy);
 }
 
 /*
@@ -1983,6 +2684,7 @@ scan_table_blocks_logical(Relation rel, BlockNumber start, BlockNumber end,
                           ChecksumAccum *acc, bool *found_invalid)
 {
     BlockNumber blkno;
+    BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
 
     for (blkno = start; blkno < end; blkno++)
     {
@@ -1991,9 +2693,20 @@ scan_table_blocks_logical(Relation rel, BlockNumber start, BlockNumber end,
         OffsetNumber maxoff;
         OffsetNumber offnum;
 
-        buffer = ReadBuffer(rel, blkno);
+        buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+                                    bstrategy);
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buffer);
+
+        if (PageIsNew(page))
+        {
+            UnlockReleaseBuffer(buffer);
+            if ((blkno & 63) == 0)
+                CHECK_FOR_INTERRUPTS();
+            continue;
+        }
+
+        pg_checksums_check_page(rel, blkno, page);
 
         maxoff = PageGetMaxOffsetNumber(page);
         for (offnum = FirstOffsetNumber; offnum <= maxoff;
@@ -2002,13 +2715,24 @@ scan_table_blocks_logical(Relation rel, BlockNumber start, BlockNumber end,
             ItemId      lp = PageGetItemId(page, offnum);
             HeapTupleHeader htup;
             HeapTupleData tuple;
+            Size        tuple_len;
             uint32      tuple_checksum;
 
             if (!ItemIdIsNormal(lp))
                 continue;
 
+            if (!pg_checksums_item_is_sane(page, lp))
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_CORRUPTED),
+                         errmsg("corrupt line pointer in relation \"%s\" at block %u, offset %u",
+                                RelationGetRelationName(rel), blkno, offnum)));
+
             htup = (HeapTupleHeader) PageGetItem(page, lp);
-            tuple.t_len = ItemIdGetLength(lp);
+            tuple_len = ItemIdGetLength(lp);
+
+            pg_checksums_check_heap_tuple(rel, blkno, offnum, htup, tuple_len);
+
+            tuple.t_len = tuple_len;
             tuple.t_data = htup;
             tuple.t_tableOid = RelationGetRelid(rel);
             ItemPointerSet(&tuple.t_self, blkno, offnum);
@@ -2032,6 +2756,8 @@ scan_table_blocks_logical(Relation rel, BlockNumber start, BlockNumber end,
         if ((blkno & 63) == 0)
             CHECK_FOR_INTERRUPTS();
     }
+
+    FreeAccessStrategy(bstrategy);
 }
 
 /*
@@ -2059,12 +2785,17 @@ scan_index_blocks_physical(Relation idxRel, BlockNumber start, BlockNumber end,
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
         page = BufferGetPage(buffer);
-        page_size = PageGetPageSize(page);
 
         if (!PageIsNew(page))
         {
             PageHeader phdr = (PageHeader) page;
 
+            /*
+             * Always hash a complete block.  PageGetPageSize() comes from
+             * the page header and a corrupted value could make us read past
+             * the buffer.
+             */
+            page_size = BLCKSZ;
             page_hash = fnv1a_32_hash((char *) page, page_size, 0);
 
             if (is_brin)
@@ -2074,14 +2805,21 @@ scan_index_blocks_physical(Relation idxRel, BlockNumber start, BlockNumber end,
 
                 page_hash = combine_checksums(page_hash, (uint32) page_size);
 
-                special_space = (uint8 *) PageGetSpecialPointer(page);
-                special_size = PageGetSpecialSize(page);
-                if (special_size >= 4)
+                /*
+                 * The BRIN special area can only be inspected when the page
+                 * header is sane; the raw page bytes are still hashed above.
+                 */
+                if (pg_checksums_page_header_sane(page))
                 {
-                    uint32      brin_info = 0;
+                    special_space = (uint8 *) PageGetSpecialPointer(page);
+                    special_size = PageGetSpecialSize(page);
+                    if (special_size >= 4)
+                    {
+                        uint32      brin_info = 0;
 
-                    memcpy(&brin_info, special_space, 4);
-                    page_hash = combine_checksums(page_hash, brin_info);
+                        memcpy(&brin_info, special_space, 4);
+                        page_hash = combine_checksums(page_hash, brin_info);
+                    }
                 }
 
                 page_hash = combine_checksums(page_hash, blkno);
@@ -2104,7 +2842,7 @@ scan_index_blocks_physical(Relation idxRel, BlockNumber start, BlockNumber end,
         else
         {
             page_hash = fnv1a_32_hash(is_brin ? "BRIN_NEW" : "NEW_PAGE", 8, blkno);
-            page_hash = combine_checksums(page_hash, (uint32) page_size);
+            page_hash = combine_checksums(page_hash, (uint32) PageGetPageSize(page));
             checksum_accum_add(acc, page_hash);
         }
 
@@ -2156,6 +2894,8 @@ scan_index_blocks_logical(Relation idxRel, BlockNumber start, BlockNumber end,
         {
             firstoff = FirstOffsetNumber;
 
+            pg_checksums_check_page(idxRel, blkno, page);
+
             /*
              * For B-tree indexes, skip deleted/half-dead pages and internal
              * (non-leaf) pages, whose entries are structural pivot tuples
@@ -2187,13 +2927,20 @@ scan_index_blocks_logical(Relation idxRel, BlockNumber start, BlockNumber end,
             {
                 ItemId      itemId = PageGetItemId(page, offnum);
 
-                if (ItemIdIsUsed(itemId) && !ItemIdIsDead(itemId))
+                if (ItemIdIsNormal(itemId))
                 {
                     IndexTuple  itup;
                     int         i;
                     uint32      entry_hash = FNV_BASIS_32;
                     ItemPointerData tid;
                     uint32      tid_hash;
+
+                    if (!pg_checksums_item_is_sane(page, itemId))
+                        ereport(ERROR,
+                                (errcode(ERRCODE_DATA_CORRUPTED),
+                                 errmsg("corrupt line pointer in index \"%s\" at block %u, offset %u",
+                                        RelationGetRelationName(idxRel), blkno,
+                                        offnum)));
 
                     itup = (IndexTuple) PageGetItem(page, itemId);
 
@@ -2243,7 +2990,7 @@ scan_index_blocks_logical(Relation idxRel, BlockNumber start, BlockNumber end,
  */
 static void
 compute_database_items(ChecksumRelationItem *items, uint32 start, uint32 end,
-                       bool physical, ChecksumAccum64 *acc)
+                       bool physical, ChecksumAccum64 *acc, bool *had_error)
 {
     uint32      i;
 
@@ -2253,47 +3000,58 @@ compute_database_items(ChecksumRelationItem *items, uint32 start, uint32 end,
         char        relkind = items[i].relkind;
         uint64      rel_checksum = 0;
         bool        skip = false;
+        MemoryContext oldcontext;
+        ResourceOwner oldowner;
+
+        /*
+         * Each relation is checksummed in an internal subtransaction.  If a
+         * relation cannot be processed (dropped concurrently, corrupt,
+         * unsupported, ...), the subtransaction rollback releases its locks
+         * and buffer pins, and the scan can safely continue.  Catching an
+         * error without a subtransaction would leave resources behind.
+         */
+        oldcontext = CurrentMemoryContext;
+        oldowner = CurrentResourceOwner;
+
+        BeginInternalSubTransaction(NULL);
+        /* Run statements inside the caller's memory context */
+        MemoryContextSwitchTo(oldcontext);
 
         PG_TRY();
         {
             if (relkind == RELKIND_INDEX)
             {
-                if (physical)
-                {
-                    rel_checksum = (uint64) DatumGetInt32(
-                        DirectFunctionCall1(pg_index_physical_checksum,
-                                            ObjectIdGetDatum(relid)));
-                }
-                else
-                {
-                    Datum       d = DirectFunctionCall1(pg_index_logical_checksum,
-                                                        ObjectIdGetDatum(relid));
+                bool        is_null = false;
+                uint32      value;
 
-                    if (DatumGetPointer(d) == NULL)
-                        skip = true;
-                    else
-                        rel_checksum = (uint64) DatumGetInt32(d);
-                }
+                if (physical)
+                    value = pg_index_physical_checksum_calc(relid, false,
+                                                            &is_null);
+                else
+                    value = pg_index_logical_checksum_calc(relid, false,
+                                                           &is_null);
+
+                if (is_null)
+                    skip = true;
+                else
+                    rel_checksum = (uint64) value;
             }
             else
             {
                 if (physical)
-                {
-                    Datum       d = DirectFunctionCall2(pg_table_physical_checksum,
-                                                        ObjectIdGetDatum(relid),
-                                                        BoolGetDatum(false));
-
-                    rel_checksum = DatumGetInt64(d);
-                }
+                    rel_checksum = pg_table_physical_checksum_calc(relid, false,
+                                                                   false);
                 else
                 {
-                    Datum       d = DirectFunctionCall1(pg_table_logical_checksum,
-                                                        ObjectIdGetDatum(relid));
+                    bool        is_null = false;
+                    int64       value;
 
-                    if (DatumGetPointer(d) == NULL)
+                    value = pg_table_logical_checksum_calc(relid, false,
+                                                           &is_null);
+                    if (is_null)
                         skip = true;
                     else
-                        rel_checksum = DatumGetInt64(d);
+                        rel_checksum = (uint64) value;
                 }
             }
 
@@ -2301,11 +3059,56 @@ compute_database_items(ChecksumRelationItem *items, uint32 start, uint32 end,
                 checksum_accum64_add(acc,
                                      combine_checksums_64(rel_checksum,
                                                           (uint64) relid));
+
+            /* Commit the inner transaction, return to outer xact context */
+            ReleaseCurrentSubTransaction();
+            MemoryContextSwitchTo(oldcontext);
+            CurrentResourceOwner = oldowner;
         }
         PG_CATCH();
         {
-            /* Skip relations that can't be processed. */
+            int         sqlerrcode = geterrcode();
+            ErrorData  *edata;
+
+            /*
+             * Cancellation, shutdown and out-of-memory errors mean that the
+             * result cannot be trusted; propagate them instead of silently
+             * returning a partial database checksum.
+             */
+            if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+                sqlerrcode == ERRCODE_OUT_OF_MEMORY ||
+                sqlerrcode == ERRCODE_ADMIN_SHUTDOWN ||
+                sqlerrcode == ERRCODE_CRASH_SHUTDOWN ||
+                sqlerrcode == ERRCODE_CANNOT_CONNECT_NOW)
+                PG_RE_THROW();
+
+            MemoryContextSwitchTo(oldcontext);
+            edata = CopyErrorData();
             FlushErrorState();
+
+            /* Abort the inner transaction */
+            RollbackAndReleaseCurrentSubTransaction();
+            MemoryContextSwitchTo(oldcontext);
+            CurrentResourceOwner = oldowner;
+
+            if (had_error != NULL)
+                *had_error = true;
+
+            /*
+             * Parallel workers log to the server log; the leader emits a
+             * summary warning when it folds the workers' results.
+             */
+            if (IsParallelWorker())
+                elog(LOG,
+                     "skipping relation %u while computing database checksum: %s",
+                     relid, edata->message);
+            else
+                ereport(WARNING,
+                        (errmsg("skipping relation %u while computing database checksum",
+                                relid),
+                         errdetail("%s", edata->message)));
+
+            FreeErrorData(edata);
         }
         PG_END_TRY();
     }
@@ -2329,9 +3132,12 @@ pg_checksums_parallel_worker_main(dsm_segment *seg, shm_toc *toc)
     uint32      start;
     uint32      end;
 
+    (void) seg;
+
     myresult->partial = 0;
     myresult->count = 0;
     myresult->found_invalid = false;
+    myresult->had_error = false;
 
     if (state->snapshot_size > 0)
     {
@@ -2427,7 +3233,8 @@ pg_checksums_parallel_worker_main(dsm_segment *seg, shm_toc *toc)
                 }
 
                 while (pg_checksums_consume(state, 1, &start, &end))
-                    compute_database_items(items, start, end, physical, &acc64);
+                    compute_database_items(items, start, end, physical, &acc64,
+                                           &myresult->had_error);
 
                 if (pushed)
                     PopActiveSnapshot();
@@ -2472,8 +3279,20 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
     if (is_table)
     {
         snapshot = pg_checksums_get_snapshot();
+        if (snapshot == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("no active snapshot while starting a parallel checksum scan")));
         snapshot_size = (uint32) EstimateSnapshotSpace(snapshot);
     }
+
+    /*
+     * CreateParallelContext() requires parallel mode to be active.  It also
+     * makes IsInParallelMode() true in the leader, which prevents the leader
+     * from starting a nested parallel scan when it processes its own share
+     * of a database scan.
+     */
+    EnterParallelMode();
 
     pcxt = CreateParallelContext("pg_checksums",
                                  "pg_checksums_parallel_worker_main",
@@ -2589,6 +3408,7 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
     }
 
     DestroyParallelContext(pcxt);
+    ExitParallelMode();
 
     if (found_invalid != NULL)
         *found_invalid = local_found_invalid;
@@ -2601,7 +3421,8 @@ static void
 pg_checksums_parallel_scan_database(bool physical, bool include_system,
                                     bool include_toast,
                                     ChecksumRelationItem *items, uint32 nitems,
-                                    int workers, ChecksumAccum64 *acc)
+                                    int workers, ChecksumAccum64 *acc,
+                                    bool *had_error)
 {
     ParallelContext *pcxt;
     shm_toc_estimator e;
@@ -2611,6 +3432,7 @@ pg_checksums_parallel_scan_database(bool physical, bool include_system,
     uint32      snapshot_size;
     uint32      start;
     uint32      end;
+    bool        local_had_error = false;
     int         i;
 
     /*
@@ -2619,7 +3441,13 @@ pg_checksums_parallel_scan_database(bool physical, bool include_system,
      * path.
      */
     snapshot = pg_checksums_get_snapshot();
+    if (snapshot == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("no active snapshot while starting a parallel database checksum")));
     snapshot_size = (uint32) EstimateSnapshotSpace(snapshot);
+
+    EnterParallelMode();
 
     pcxt = CreateParallelContext("pg_checksums",
                                  "pg_checksums_parallel_worker_main",
@@ -2673,16 +3501,27 @@ pg_checksums_parallel_scan_database(bool physical, bool include_system,
 
     /* The leader processes its own share of the relations. */
     while (pg_checksums_consume(state, 1, &start, &end))
-        compute_database_items(items, start, end, physical, acc);
+        compute_database_items(items, start, end, physical, acc,
+                               &local_had_error);
 
     if (pcxt->nworkers_launched > 0)
         WaitForParallelWorkersToFinish(pcxt);
 
     for (i = 0; i < workers; i++)
+    {
         if (pcxt->worker[i].bgwhandle != NULL)
+        {
             checksum_accum64_merge(acc, results[i].partial, results[i].count);
+            if (results[i].had_error)
+                local_had_error = true;
+        }
+    }
 
     DestroyParallelContext(pcxt);
+    ExitParallelMode();
+
+    if (had_error != NULL)
+        *had_error = local_had_error;
 }
 
 /*-------------------------------------------------------------------------
@@ -2716,10 +3555,15 @@ compute_database_checksum_internal(bool physical, bool include_system, bool incl
     uint32      nitems = 0;
     uint32      capacity = 64;
     ChecksumAccum64 acc = {0, 0};
+    bool        had_error = false;
     int         workers;
-    
+
     /* Use a consistent snapshot */
-    snapshot = GetActiveSnapshot();
+    snapshot = pg_checksums_get_snapshot();
+    if (snapshot == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("no active snapshot while computing database checksum")));
 
     /* Collect the matching relations first. */
     items = (ChecksumRelationItem *) palloc(capacity * sizeof(ChecksumRelationItem));
@@ -2733,7 +3577,7 @@ compute_database_checksum_internal(bool physical, bool include_system, bool incl
         Oid         relid = classForm->oid;
         Oid         relnamespace = classForm->relnamespace;
         char        relkind = classForm->relkind;
-        
+
         /*
          * Temporary relations are session-local: they are not part of the
          * persistent database, other sessions must not read them, and a
@@ -2744,21 +3588,34 @@ compute_database_checksum_internal(bool physical, bool include_system, bool incl
         if (isAnyTempNamespace(relnamespace))
             continue;
 
-        /* Apply inclusion filters */
-        if (!include_system && 
-            (relnamespace == PG_CATALOG_NAMESPACE ||
-             relnamespace == PG_TOAST_NAMESPACE))
+        /*
+         * Shared catalogs belong to the cluster rather than to this
+         * database.  They are deliberately not part of a per-database
+         * checksum, even when include_system is true.
+         */
+        if (classForm->relisshared)
             continue;
 
-        if (!include_toast && relkind == RELKIND_TOASTVALUE)
+        /*
+         * TOAST relations use a tuple format of their own.  A physical
+         * checksum can hash their raw pages; a logical checksum already
+         * covers the toast content when the parent table detoasts it.
+         */
+        if (relnamespace == PG_TOAST_NAMESPACE)
+        {
+            if (!physical || !include_toast)
+                continue;
+        }
+        else if (!include_system && relnamespace == PG_CATALOG_NAMESPACE)
             continue;
 
         /* Skip non-table/index relations */
-        if (relkind != RELKIND_RELATION && 
+        if (relkind != RELKIND_RELATION &&
             relkind != RELKIND_INDEX &&
-            relkind != RELKIND_MATVIEW)
+            relkind != RELKIND_MATVIEW &&
+            relkind != RELKIND_TOASTVALUE)
             continue;
-        
+
         if (nitems >= capacity)
         {
             capacity *= 2;
@@ -2777,17 +3634,22 @@ compute_database_checksum_internal(bool physical, bool include_system, bool incl
     table_close(pg_class_rel, AccessShareLock);
 
     workers = pg_checksums_worker_count();
-    if (workers > (int) nitems)
+    if (nitems < (uint32) workers)
         workers = (int) nitems;
 
     if (workers < 1)
-        compute_database_items(items, 0, nitems, physical, &acc);
+        compute_database_items(items, 0, nitems, physical, &acc, &had_error);
     else
         pg_checksums_parallel_scan_database(physical, include_system,
                                             include_toast, items, nitems,
-                                            workers, &acc);
+                                            workers, &acc, &had_error);
 
     pfree(items);
+
+    if (had_error)
+        ereport(WARNING,
+                (errmsg("database checksum skipped one or more relations"),
+                 errhint("Inspect the server log for the affected relations.")));
 
     return checksum_accum64_finalize(&acc);
 }

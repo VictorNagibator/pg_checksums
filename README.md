@@ -39,9 +39,14 @@
 ### Logical Checksums
 
 * **Depend on**: Only logical data content (cell values, primary keys)
-* **Stable across**: Physical reorganization, `VACUUM FULL`, `CLUSTER`, `REINDEX`
+* **Stable across**: Physical reorganization for table-level checksums
+  (`VACUUM FULL`, `CLUSTER`, `REINDEX`)
 * **Useful for**: Logical consistency, replication validation, migration verification
 * **Requires**: Primary keys for tuple/table/database logical checksums
+* **Index caveat**: logical checksums are available for B-tree only.  They
+  include heap TIDs, and database-level logical checksums include indexes, so
+  the database checksum can change when dead index entries are removed by
+  `VACUUM`.  See [Limitations](#limitations-and-portability).
 
 ---
 
@@ -51,6 +56,15 @@
 
 * PostgreSQL 12 or later (tested on 12, 13, 14, 15, 16, 17, and 18)
 * C compiler and PostgreSQL development headers
+* Superuser access to install the extension and to run the database-level
+  checksum functions
+
+> **Privileges:** the table, page, cell, tuple and index checksum functions
+> read relation storage directly.  They require `SELECT` on the relation (or
+> on the base table for an index) and reject relations protected by row-level
+> security, because a direct page scan cannot apply RLS policies.  The
+> database-level functions are superuser-only; this is enforced in C, not just
+> in SQL.
 
 > **Note:** PostgreSQL 12 and 13 are past end-of-life upstream, but they are
 > still fully supported by this extension. The build deliberately fails with a
@@ -100,6 +114,10 @@ pgxn install pg_checksums
 **`pg_page_checksum(regclass, integer) -> integer`**
 
 Computes PostgreSQL's built-in page checksum for physical page corruption detection.
+The block number is validated: an out-of-range block (including `-1`, which
+would otherwise be interpreted as `P_NEW`) raises an error instead of reading
+or extending the relation.  The page is copied before the checksum is
+computed, so the shared buffer is never modified.
 
 ```sql
 -- Get checksum for page 5 of a table
@@ -111,6 +129,8 @@ SELECT pg_page_checksum('my_table'::regclass, 5);
 **`pg_cell_checksum(regclass, tid, integer) -> integer`**
 
 Computes logical checksum of a cell value. NULL values return `CHECKSUM_NULL` (-1).
+Requires `SELECT` on the relation; an out-of-range TID or attribute number
+returns NULL.  Relations protected by row-level security are rejected.
 
 ```sql
 -- Get checksum for cell (column) 3 of a specific tuple
@@ -124,6 +144,8 @@ SELECT pg_cell_checksum('employees'::regclass, '(5,2)'::tid, 3);
 **`pg_tuple_physical_checksum(regclass, tid, boolean) -> integer`**
 
 Computes physical tuple checksum based on physical location (block, offset).
+Requires `SELECT` on the relation.  An invalid TID returns NULL; a corrupted
+line pointer or tuple header raises a clean `DATA_CORRUPTED` error.
 
 ```sql
 -- Physical checksum without header
@@ -138,6 +160,9 @@ FROM orders WHERE order_id = 123;
 **`pg_tuple_logical_checksum(regclass, tid, boolean) -> integer`**
 
 Computes logical tuple checksum based on primary key values and data content. Returns NULL if no PK.
+Requires `SELECT`; relations protected by row-level security are rejected.
+Note that `include_header = true` includes the tuple header (xmin/xmax/ctid),
+so that variant is not stable across physical reorganization.
 
 ```sql
 -- Logical checksum (requires primary key)
@@ -150,6 +175,17 @@ FROM customers WHERE customer_id = 456;
 **`pg_table_physical_checksum(regclass, boolean) -> bigint`**
 
 Aggregates physical tuple checksums for entire table (order-independent).
+Requires `SELECT` on the table.  The function accepts ordinary tables,
+materialized views, partitioned tables and (for physical checksums) TOAST
+relations.  A TOAST relation is checksummed as raw pages, because its tuples
+are not heap tuples.  A corrupted page produces a clean error rather than
+crashing the backend.
+
+For an ordinary table, the physical checksum covers the main heap only: a
+TOAST value is represented by its pointer in the main tuple, so corruption
+inside the TOAST data is not detected by this function.  Use
+`pg_table_logical_checksum` (which detoasts values) or a database physical
+checksum with `include_toast = true` to cover TOAST content.
 
 ```sql
 -- Table physical checksum
@@ -162,6 +198,8 @@ SELECT pg_table_physical_checksum('inventory'::regclass, true);
 **`pg_table_logical_checksum(regclass) -> bigint`**
 
 Aggregates logical tuple checksums for entire table. Requires primary key.
+Requires `SELECT` on the table; returns NULL for a TOAST relation (toast
+content is covered when the parent table detoasts its values).
 
 ```sql
 -- Table logical checksum (requires PK)
@@ -187,6 +225,9 @@ SELECT pg_table_logical_checksum('sales'::regclass);
 **`pg_index_physical_checksum(regclass) -> integer`**
 
 Computes physical checksum of index structure. Supports B-tree, Hash, GiST, GIN, SP-GiST, BRIN.
+Requires `SELECT` on the underlying table.  Returns NULL for an unsupported
+access method and for a partitioned index (leaf-index aggregation is not
+implemented yet).
 
 ```sql
 -- Physical checksum of a B-tree index
@@ -195,10 +236,18 @@ SELECT pg_index_physical_checksum('idx_product_name'::regclass);
 
 **`pg_index_logical_checksum(regclass) -> integer`**
 
-Computes logical checksum of index key values. Stable across REINDEX.
+Computes logical checksum of index key values. Stable across REINDEX with the
+same data.
+
+**B-tree only.**  Hash, GiST, GIN, SP-GiST and BRIN pages do not contain
+ordinary index tuples; trying to interpret them produced meaningless values
+and, for SP-GiST, a server crash.  Those access methods now return NULL for
+the logical checksum (physical checksums remain available).  The checksum
+includes heap TIDs, so it changes when heap tuples move (for example after
+`CLUSTER` or `VACUUM FULL`).
 
 ```sql
--- Logical checksum of index (key values only)
+-- Logical checksum of a B-tree index
 SELECT pg_index_logical_checksum('idx_product_name'::regclass);
 ```
 
@@ -206,7 +255,9 @@ SELECT pg_index_logical_checksum('idx_product_name'::regclass);
 
 **`pg_database_physical_checksum(boolean, boolean) -> bigint`**
 
-Aggregates physical relation checksums for entire database.
+Aggregates physical relation checksums for entire database.  Superuser-only;
+the check is enforced in C (the SQL functions are security invoker, so
+`superuser()` sees the calling session user).
 
 ```sql
 -- Database physical checksum (excluding system tables)
@@ -216,11 +267,33 @@ SELECT pg_database_physical_checksum(false, false);
 SELECT pg_database_physical_checksum(true, true);
 ```
 
-**Note about shared system tables**: The pg_database_checksum function only includes tables from the current database. Cluster-wide shared system tables (e.g., pg_authid, pg_database) are not included in the checksum calculation as they belong to the entire PostgreSQL cluster, not to individual databases.
+**TOAST:** `include_toast` is independent of `include_system`.  With
+`include_toast = true`, TOAST relations are hashed as raw pages.  With
+`include_toast = false` (the default), changes inside toasted values are not
+covered by the physical database checksum; table-level physical checksums
+store only the toast pointer in the main tuple.
+
+**Note about shared system tables**: The database checksum only includes
+relations from the current database.  Cluster-wide shared catalogs (e.g.,
+`pg_authid`, `pg_database`) are excluded even when `include_system` is true.
+
+**Skipped relations:** if a relation cannot be processed (dropped
+concurrently, corrupt, unsupported, ...), the scan rolls back an internal
+subtransaction, emits a warning and continues.  A summary warning is emitted
+at the end.  Cancellation and `statement_timeout` are propagated, so a
+canceled scan never returns a partial result as if it were complete.
 
 **`pg_database_logical_checksum(boolean, boolean) -> bigint`**
 
 Aggregates logical relation checksums for entire database. Skips tables without PK.
+Superuser-only (enforced in C).  TOAST relations are skipped: their content is
+covered when the parent table detoasts the values.
+
+Because the database logical checksum includes indexes, and logical index
+checksums include heap TIDs and currently visible index entries, the database
+checksum can change when dead index entries are removed by `VACUUM`.  Use
+table-level logical checksums when you need a pure content fingerprint; see
+[Limitations](#limitations-and-portability).
 
 ```sql
 -- Database logical checksum
@@ -288,6 +361,50 @@ The extension properly handles all PostgreSQL type categories:
 * **Varlena types** (text, bytea): Detoasted and entire structure hashed
 * **C-string types**: Null-terminated string hashed
 * **Pass-by-reference types**: Pointer dereferenced and data hashed
+
+---
+
+## Limitations and Portability
+
+These limitations are documented rather than silently ignored; several of them
+will be addressed by the planned checksum-format (pg_checksums v2).
+
+* **Not portable between databases.** Table, partition and database logical
+  checksums mix relation OIDs into the result, and enum/composite/array values
+  include type OIDs.  Two databases with identical content therefore produce
+  different checksums.  To compare tables, mask the low 32 bits only for
+  non-partitioned tables, or compare table-level values after normalising OIDs
+  in application code.  A portable content-only mode is planned.
+* **Not canonical for every type.** `numeric` values with different display
+  scale (for example `1.0` and `1.00`) are SQL-equal but hash differently;
+  composite and array values include type OIDs; pass-by-value hashes use the
+  native byte order.
+* **Physical checksums are not replica fingerprints.** Tuple/table physical
+  checksums depend on tuple locations, MVCC fields, tuple bytes and the
+  relation's relfilenode/reltablespace; index physical checksums hash raw
+  index pages, including page LSNs.  A standby, a restored backup or a table
+  re-created with the same data usually produces different physical
+  checksums.  Planner statistics are not part of the checksum, so `ANALYZE`
+  does not change it; use physical checksums to detect on-disk corruption
+  within one cluster, not to compare replicas.
+* **Logical index checksums are B-tree only.**  For B-tree they include heap
+  TIDs, and they currently include index entries that are not yet removed by
+  `VACUUM` (including entries from aborted transactions).  Database logical
+  checksums include indexes, so they can change after `VACUUM` even though the
+  logical table contents did not.
+* **Tables without a primary key are skipped** by logical table/database
+  checksums.  Their indexes are still included, which makes the database
+  checksum change on vacuum and TID movement without covering the table data.
+* **Coverage gaps.**  The database physical checksum does not include TOAST
+  content by default, and never includes sequences, large objects (unless
+  `include_system = true`), FSM/VM forks or relation free space.
+* **32-bit content hashes.**  Table and index functions return a 64-bit value
+  whose content component is 32 bits.  This is adequate for accidental
+  corruption detection but not for cryptographic tamper evidence; FNV-1a is
+  not a cryptographic hash.
+* **Aggregation is XOR-based.**  XOR is order-independent and parallel-safe,
+  but it can mask duplicate entries.  A sum-plus-count aggregate and 64-bit
+  content hashes are planned for v2.
 
 ---
 
@@ -361,16 +478,23 @@ SELECT
 ### 2. Replication Consistency Validation
 
 ```sql
--- Compare source and replica consistency
+-- Compare source and replica consistency.
+-- IMPORTANT: this only works when the replica has the same relation OIDs and
+-- heap TIDs (for example a physical standby that has not been vacuumed
+-- differently).  Physical checksums include LSNs and are usually not equal on
+-- a standby; logical checksums include OIDs.  See Limitations.
 -- Run on source:
 SELECT 
-    table_name,
-    pg_table_logical_checksum(table_name::regclass) as logical_cs,
-    pg_table_physical_checksum(table_name::regclass, false) as physical_cs
-FROM information_schema.tables 
-WHERE table_schema = 'public';
+    c.relname,
+    pg_table_logical_checksum(c.oid) as logical_cs,
+    pg_table_physical_checksum(c.oid, false) as physical_cs
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p', 'm')
+ORDER BY c.relname;
 
--- Run same query on replica and compare results
+-- Run the same query on the replica and compare results.
 ```
 
 ### 3. Data Migration Verification
@@ -508,6 +632,12 @@ on Linux, macOS, and Windows.
 6. Error conditions and edge cases
 7. Parallel vs serial checksum consistency at the table, index, and database levels
 8. Partitioned tables (single- and multi-level, with and without primary keys)
+9. Safety and validation: non-B-tree logical index checksums return NULL,
+   invalid block numbers/TIDs are rejected, views/sequences/indexes are
+   rejected by table functions, SELECT privileges and RLS are enforced, and
+   TOAST physical checksums are computed from raw pages
+10. Corrupt page handling: unsafe page headers and line pointers produce clean
+    errors; database scans skip the affected relation with a warning
 
 ---
 
@@ -518,17 +648,22 @@ To streamline the development workflow, the extension includes a helper script `
 - Cleans previous builds (`make clean`)
 - Builds the extension with parallel jobs (`make -j$JOBS`, `JOBS` defaults to 4)
 - Installs it into the target PostgreSQL installation (using the provided `pg_config`)
-- Starts the PostgreSQL server (if not already running)
-- Runs the regression and TAP tests (`make installcheck`)
-- Stops the server automatically, even if tests fail
+- Starts the PostgreSQL server only if it is not already running
+- Runs the regression tests (`make installcheck`); TAP tests are run only when
+  `RUN_TAP=yes`
+- Stops the server only if the script started it, and leaves an already
+  running server alone
 
 ```bash
 # Run it from the extension’s root directory
 ./run_tests.sh
+
+# Also run TAP tests
+RUN_TAP=yes ./run_tests.sh
 ```
 ### Customization
 
-The script uses the same environment settings as your manual commands. You can adjust the following variables inside the script to match your environment:
+The script uses the same environment settings as your manual commands. You can adjust the following variables in the environment:
 
 * `PG_CONFIG` – path to `pg_config` of the target PostgreSQL installation
 
@@ -537,6 +672,12 @@ The script uses the same environment settings as your manual commands. You can a
 * `PGDATA` – data directory of the test cluster
 
 * `JOBS` – number of parallel build jobs (passed to `make -j`)
+
+* `SUDO` – command used for `make install` (defaults to `sudo`; empty as root)
+
+* `RUN_TAP` – set to `yes` to run the TAP suite
+
+* `CLEAN` – set to `yes` to remove build artifacts on exit
 
 ---
 
@@ -569,8 +710,8 @@ So bump the version in `pg_checksums.control`, `META.json` and `Changes`, add
 the new SQL script (and an upgrade script if needed), and only then tag:
 
 ```bash
-git tag -a v1.1.0 -m "pg_checksums 1.1.0"
-git push origin v1.1.0
+git tag -a v1.1.1 -m "pg_checksums 1.1.1"
+git push origin v1.1.1
 ```
 
 ---
