@@ -30,7 +30,10 @@ Revision history for pg_checksums
     - Database scans now run each relation in an internal subtransaction.
       Errors release locks and buffer pins, are reported as a warning and no
       longer produce a silently partial checksum.  Cancellation and statement
-      timeouts are propagated instead of being swallowed.
+      timeouts are propagated instead of being swallowed.  PostgreSQL 12-16
+      prohibit internal subtransactions in parallel mode; there a relation
+      error aborts a parallel database scan, while serial scans (workers = 0)
+      and PostgreSQL 17+ still skip the relation with a warning.
     - Enter parallel mode before creating a parallel context and leave it
       after destroying it.  This fixes assertion failures in --enable-cassert
       builds and prevents the leader from starting nested parallel workers

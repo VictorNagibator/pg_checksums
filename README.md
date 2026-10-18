@@ -283,6 +283,13 @@ subtransaction, emits a warning and continues.  A summary warning is emitted
 at the end.  Cancellation and `statement_timeout` are propagated, so a
 canceled scan never returns a partial result as if it were complete.
 
+**PostgreSQL 12-16 and parallel database scans:** those releases prohibit
+internal subtransactions while in parallel mode.  A parallel database scan
+therefore cannot isolate relation errors: if a relation fails, the scan is
+aborted.  Run with `pg_checksums.workers = 0` (the default) to get the
+skip-with-warning behavior on PostgreSQL 12-16.  Serial scans and parallel
+scans on PostgreSQL 17+ isolate errors as described above.
+
 **`pg_database_logical_checksum(boolean, boolean) -> bigint`**
 
 Aggregates logical relation checksums for entire database. Skips tables without PK.

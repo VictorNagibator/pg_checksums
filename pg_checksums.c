@@ -400,6 +400,8 @@ static void scan_index_blocks_physical(Relation idxRel, BlockNumber start,
                                        ChecksumAccum *acc);
 static void scan_index_blocks_logical(Relation idxRel, BlockNumber start,
                                       BlockNumber end, ChecksumAccum *acc);
+static void compute_database_item(Oid relid, char relkind, bool physical,
+                                  uint64 *rel_checksum, bool *skip);
 static void compute_database_items(ChecksumRelationItem *items, uint32 start,
                                    uint32 end, bool physical,
                                    ChecksumAccum64 *acc, bool *had_error);
@@ -2986,6 +2988,54 @@ scan_index_blocks_logical(Relation idxRel, BlockNumber start, BlockNumber end,
 }
 
 /*
+ * compute_database_item - compute the checksum of one relation
+ *
+ * Sets *skip when the relation has no usable checksum (unsupported AM,
+ * partitioned index, table without a primary key in logical mode, or TOAST
+ * relation in logical mode).
+ */
+static void
+compute_database_item(Oid relid, char relkind, bool physical,
+                      uint64 *rel_checksum, bool *skip)
+{
+    *rel_checksum = 0;
+    *skip = false;
+
+    if (relkind == RELKIND_INDEX)
+    {
+        bool        is_null = false;
+        uint32      value;
+
+        if (physical)
+            value = pg_index_physical_checksum_calc(relid, false, &is_null);
+        else
+            value = pg_index_logical_checksum_calc(relid, false, &is_null);
+
+        if (is_null)
+            *skip = true;
+        else
+            *rel_checksum = (uint64) value;
+    }
+    else
+    {
+        if (physical)
+            *rel_checksum = pg_table_physical_checksum_calc(relid, false,
+                                                            false);
+        else
+        {
+            bool        is_null = false;
+            int64       value;
+
+            value = pg_table_logical_checksum_calc(relid, false, &is_null);
+            if (is_null)
+                *skip = true;
+            else
+                *rel_checksum = (uint64) value;
+        }
+    }
+}
+
+/*
  * compute_database_items - database checksum over a range of relations
  */
 static void
@@ -3003,6 +3053,27 @@ compute_database_items(ChecksumRelationItem *items, uint32 start, uint32 end,
         MemoryContext oldcontext;
         ResourceOwner oldowner;
 
+#if PG_VERSION_NUM < 170000
+        /*
+         * PostgreSQL 12-16 prohibit internal subtransactions while in
+         * parallel mode.  The leader of a parallel database scan is in
+         * parallel mode too, so neither the leader nor a worker can use the
+         * subtransaction-based error recovery below.  Run the relation
+         * checksum directly; an error then aborts the parallel scan.  There
+         * is no safe way to catch and continue without a subtransaction.
+         */
+        if (IsInParallelMode())
+        {
+            compute_database_item(relid, relkind, physical, &rel_checksum,
+                                  &skip);
+            if (!skip)
+                checksum_accum64_add(acc,
+                                     combine_checksums_64(rel_checksum,
+                                                          (uint64) relid));
+            continue;
+        }
+#endif
+
         /*
          * Each relation is checksummed in an internal subtransaction.  If a
          * relation cannot be processed (dropped concurrently, corrupt,
@@ -3019,41 +3090,8 @@ compute_database_items(ChecksumRelationItem *items, uint32 start, uint32 end,
 
         PG_TRY();
         {
-            if (relkind == RELKIND_INDEX)
-            {
-                bool        is_null = false;
-                uint32      value;
-
-                if (physical)
-                    value = pg_index_physical_checksum_calc(relid, false,
-                                                            &is_null);
-                else
-                    value = pg_index_logical_checksum_calc(relid, false,
-                                                           &is_null);
-
-                if (is_null)
-                    skip = true;
-                else
-                    rel_checksum = (uint64) value;
-            }
-            else
-            {
-                if (physical)
-                    rel_checksum = pg_table_physical_checksum_calc(relid, false,
-                                                                   false);
-                else
-                {
-                    bool        is_null = false;
-                    int64       value;
-
-                    value = pg_table_logical_checksum_calc(relid, false,
-                                                           &is_null);
-                    if (is_null)
-                        skip = true;
-                    else
-                        rel_checksum = (uint64) value;
-                }
-            }
+            compute_database_item(relid, relkind, physical, &rel_checksum,
+                                  &skip);
 
             if (!skip)
                 checksum_accum64_add(acc,
