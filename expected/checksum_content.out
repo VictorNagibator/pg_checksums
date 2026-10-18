@@ -1,0 +1,210 @@
+-- Content-only table checksum and strict-mode tests
+-- Test A: content checksum does not require a primary key and ignores OIDs
+CREATE TABLE test_content_pk (
+    id integer PRIMARY KEY,
+    value integer,
+    label text
+);
+CREATE TABLE test_content_nopk (
+    id integer,
+    value integer,
+    label text
+);
+INSERT INTO test_content_pk
+SELECT gs, gs % 7, 'value_' || gs FROM generate_series(1, 100) gs;
+INSERT INTO test_content_nopk
+SELECT id, value, label FROM test_content_pk;
+SELECT
+    pg_table_content_checksum('test_content_nopk'::regclass) IS NOT NULL
+        AS nopk_content_non_null,
+    pg_table_content_checksum('test_content_pk'::regclass) =
+    pg_table_content_checksum('test_content_nopk'::regclass)
+        AS pk_and_nopk_content_equal;
+ nopk_content_non_null | pk_and_nopk_content_equal 
+-----------------------+---------------------------
+ t                     | t
+(1 row)
+
+-- Test B: duplicate rows are preserved (sum + count, not XOR)
+CREATE TABLE test_content_dup (value text);
+CREATE TABLE test_content_one (value text);
+INSERT INTO test_content_dup VALUES ('a'), ('a');
+INSERT INTO test_content_one VALUES ('a');
+SELECT
+    pg_table_content_checksum('test_content_dup'::regclass) <>
+    pg_table_content_checksum('test_content_one'::regclass)
+        AS duplicates_change_content;
+ duplicates_change_content 
+---------------------------
+ t
+(1 row)
+
+-- Test C: empty tables have a stable content checksum
+CREATE TABLE test_content_empty1 (value text);
+CREATE TABLE test_content_empty2 (value text);
+SELECT
+    pg_table_content_checksum('test_content_empty1'::regclass) IS NOT NULL
+        AS empty_content_non_null,
+    pg_table_content_checksum('test_content_empty1'::regclass) =
+    pg_table_content_checksum('test_content_empty2'::regclass)
+        AS empty_content_equal;
+ empty_content_non_null | empty_content_equal 
+------------------------+---------------------
+ t                      | t
+(1 row)
+
+-- Test D: changes are detected
+DO $$
+DECLARE
+    before bigint;
+    after bigint;
+BEGIN
+    before := pg_table_content_checksum('test_content_nopk'::regclass);
+
+    UPDATE test_content_nopk SET label = 'changed' WHERE id = 1;
+    after := pg_table_content_checksum('test_content_nopk'::regclass);
+
+    IF before = after THEN
+        RAISE EXCEPTION 'content checksum did not change after UPDATE';
+    END IF;
+
+    UPDATE test_content_nopk SET label = 'value_1' WHERE id = 1;
+END;
+$$;
+-- Test E: partitioned and unpartitioned tables with the same rows agree
+CREATE TABLE test_content_part (
+    id integer,
+    value integer,
+    label text
+) PARTITION BY LIST (value);
+CREATE TABLE test_content_part_0 PARTITION OF test_content_part
+    FOR VALUES IN (0);
+CREATE TABLE test_content_part_1 PARTITION OF test_content_part
+    FOR VALUES IN (1);
+CREATE TABLE test_content_unpart (
+    id integer,
+    value integer,
+    label text
+);
+INSERT INTO test_content_part VALUES (1, 0, 'a'), (2, 1, 'b');
+INSERT INTO test_content_unpart VALUES (1, 0, 'a'), (2, 1, 'b');
+SELECT
+    pg_table_content_checksum('test_content_part'::regclass) =
+    pg_table_content_checksum('test_content_unpart'::regclass)
+        AS partitioned_content_equal;
+ partitioned_content_equal 
+---------------------------
+ t
+(1 row)
+
+-- Test F: TOAST relations have no independent content checksum
+CREATE TABLE test_content_toast (
+    id integer PRIMARY KEY,
+    payload text
+);
+INSERT INTO test_content_toast
+SELECT gs, repeat(md5(gs::text), 1000) FROM generate_series(1, 20) gs;
+SELECT
+    pg_table_content_checksum('test_content_toast'::regclass) IS NOT NULL
+        AS toast_parent_content_non_null,
+    pg_table_content_checksum(c.reltoastrelid::regclass) IS NULL
+        AS toast_relation_content_null
+FROM pg_class c
+WHERE c.oid = 'test_content_toast'::regclass;
+ toast_parent_content_non_null | toast_relation_content_null 
+-------------------------------+-----------------------------
+ t                             | t
+(1 row)
+
+-- Test G: non-heap relations are rejected
+CREATE VIEW test_content_view AS SELECT * FROM test_content_pk;
+CREATE SEQUENCE test_content_seq;
+DO $$
+DECLARE
+    rejected boolean;
+BEGIN
+    rejected := false;
+    BEGIN
+        PERFORM pg_table_content_checksum('test_content_view'::regclass);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'content checksum accepted a view';
+    END IF;
+
+    rejected := false;
+    BEGIN
+        PERFORM pg_table_content_checksum('test_content_seq'::regclass);
+    EXCEPTION WHEN wrong_object_type THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'content checksum accepted a sequence';
+    END IF;
+END;
+$$;
+-- Test H: pg_checksums.strict turns skipped relations into errors
+CREATE INDEX test_content_gin ON test_content_nopk
+    USING gin (to_tsvector('simple', label));
+SELECT pg_database_logical_checksum(false, false) IS NOT NULL
+    AS non_strict_logical_non_null;
+ non_strict_logical_non_null 
+-----------------------------
+ t
+(1 row)
+
+SET pg_checksums.strict = on;
+DO $$
+DECLARE
+    failed boolean;
+BEGIN
+    failed := false;
+    BEGIN
+        PERFORM pg_database_logical_checksum(false, false);
+    EXCEPTION WHEN feature_not_supported THEN
+        failed := true;
+    END;
+    IF NOT failed THEN
+        RAISE EXCEPTION 'strict logical database checksum did not fail';
+    END IF;
+END;
+$$;
+SELECT pg_database_physical_checksum(false, false) IS NOT NULL
+    AS strict_physical_non_null;
+ strict_physical_non_null 
+--------------------------
+ t
+(1 row)
+
+-- Strict mode also aborts parallel database scans.
+SET pg_checksums.workers = 2;
+DO $$
+DECLARE
+    failed boolean;
+BEGIN
+    failed := false;
+    BEGIN
+        PERFORM pg_database_logical_checksum(false, false);
+    EXCEPTION WHEN feature_not_supported THEN
+        failed := true;
+    END;
+    IF NOT failed THEN
+        RAISE EXCEPTION 'strict parallel logical database checksum did not fail';
+    END IF;
+END;
+$$;
+RESET pg_checksums.workers;
+RESET pg_checksums.strict;
+-- Clean up
+DROP VIEW test_content_view;
+DROP SEQUENCE test_content_seq;
+DROP TABLE test_content_pk;
+DROP TABLE test_content_nopk;
+DROP TABLE test_content_dup;
+DROP TABLE test_content_one;
+DROP TABLE test_content_empty1;
+DROP TABLE test_content_empty2;
+DROP TABLE test_content_part;
+DROP TABLE test_content_unpart;
+DROP TABLE test_content_toast;

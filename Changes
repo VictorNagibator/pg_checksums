@@ -1,5 +1,32 @@
 Revision history for pg_checksums
 
+1.2.0   2026-10-18
+
+    - Add partitioned index support.  pg_index_physical_checksum() and
+      pg_index_logical_checksum() now aggregate the checksums of all leaf
+      indexes instead of returning NULL for the partitioned parent.  Each leaf
+      contributes combine(leaf checksum, leaf OID) to an order-independent
+      aggregate, and the parent OID is folded in at the end; logical
+      aggregation does the same for B-tree leaves.
+    - Add pg_table_content_checksum(regclass).  It does not require a primary
+      key and does not include relation OIDs, so it can be used for tables
+      without a PK and for content comparison across databases.  Duplicate
+      rows are preserved by a sum-plus-count aggregate, and partitioned tables
+      aggregate all leaf rows into the same accumulator.
+    - Add the pg_checksums.strict GUC.  When enabled, database checksum
+      functions fail if a relation cannot be checksummed (missing primary key,
+      unsupported index access method, or a scan error) instead of silently
+      skipping it.  The default remains false.  Strict errors release the
+      per-relation internal subtransaction before propagating, so an exception
+      handler can catch them safely.
+    - Fix parallel scans to destroy the parallel context and leave parallel
+      mode when a worker or the leader fails.  Previously an error caught by a
+      PL/pgSQL exception block could leave the backend in parallel mode, making
+      later RESET or nested parallel operations fail.
+    - Existing checksum values are unchanged for non-partitioned relations;
+      partitioned indexes change from NULL to an aggregated value, and the new
+      content checksum has its own algorithm.
+
 1.1.1   2026-10-18
 
     - Security: enforce SELECT privilege (and reject relations protected by

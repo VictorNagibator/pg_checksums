@@ -37,7 +37,7 @@ SELECT
     pg_index_physical_checksum('test_safety_spgist'::regclass) IS NOT NULL AS spgist_physical,
     pg_index_physical_checksum('test_safety_brin'::regclass) IS NOT NULL AS brin_physical;
 
--- Test B: partitioned indexes have no storage of their own.
+-- Test B: partitioned indexes aggregate their leaf indexes.
 CREATE TABLE test_safety_part (
     id integer,
     region text NOT NULL,
@@ -48,8 +48,8 @@ CREATE TABLE test_safety_part_x PARTITION OF test_safety_part FOR VALUES IN ('x'
 CREATE INDEX test_safety_part_region ON test_safety_part (region);
 
 SELECT
-    pg_index_physical_checksum('test_safety_part_region'::regclass) IS NULL AS partitioned_physical_null,
-    pg_index_logical_checksum('test_safety_part_region'::regclass) IS NULL AS partitioned_logical_null;
+    pg_index_physical_checksum('test_safety_part_region'::regclass) IS NOT NULL AS partitioned_physical_not_null,
+    pg_index_logical_checksum('test_safety_part_region'::regclass) IS NOT NULL AS partitioned_logical_not_null;
 
 -- Test C: pg_page_checksum validates the block number and never extends the
 -- relation (a negative block number used to mean P_NEW).

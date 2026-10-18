@@ -168,6 +168,66 @@ BEGIN
 END;
 $$;
 
+-- Test L: partitioned indexes aggregate their leaf indexes
+CREATE INDEX test_partitioned_data_idx ON test_partitioned (data);
+
+SELECT
+    pg_index_physical_checksum('test_partitioned_pkey'::regclass) IS NOT NULL
+        AS partitioned_pkey_physical_not_null,
+    pg_index_logical_checksum('test_partitioned_pkey'::regclass) IS NOT NULL
+        AS partitioned_pkey_logical_not_null,
+    pg_index_physical_checksum('test_partitioned_data_idx'::regclass) IS NOT NULL
+        AS partitioned_data_index_physical_not_null,
+    pg_index_logical_checksum('test_partitioned_data_idx'::regclass) IS NOT NULL
+        AS partitioned_data_index_logical_not_null;
+
+-- Test M: partitioned index checksums are deterministic
+DO $$
+DECLARE
+    phys1 integer;
+    phys2 integer;
+    logic1 integer;
+    logic2 integer;
+BEGIN
+    phys1 := pg_index_physical_checksum('test_partitioned_data_idx'::regclass);
+    logic1 := pg_index_logical_checksum('test_partitioned_data_idx'::regclass);
+    phys2 := pg_index_physical_checksum('test_partitioned_data_idx'::regclass);
+    logic2 := pg_index_logical_checksum('test_partitioned_data_idx'::regclass);
+
+    IF phys1 IS DISTINCT FROM phys2 THEN
+        RAISE EXCEPTION 'partitioned index physical checksum is not deterministic';
+    END IF;
+    IF logic1 IS DISTINCT FROM logic2 THEN
+        RAISE EXCEPTION 'partitioned index logical checksum is not deterministic';
+    END IF;
+END;
+$$;
+
+-- Test N: partitioned index checksums track changes in the leaf indexes
+DO $$
+DECLARE
+    old_phys integer;
+    old_logic integer;
+    new_phys integer;
+    new_logic integer;
+BEGIN
+    old_phys := pg_index_physical_checksum('test_partitioned_data_idx'::regclass);
+    old_logic := pg_index_logical_checksum('test_partitioned_data_idx'::regclass);
+
+    INSERT INTO test_partitioned VALUES (1000, 'west', 'new_row');
+
+    new_phys := pg_index_physical_checksum('test_partitioned_data_idx'::regclass);
+    new_logic := pg_index_logical_checksum('test_partitioned_data_idx'::regclass);
+
+    IF old_phys = new_phys THEN
+        RAISE EXCEPTION 'partitioned index physical checksum ignored a leaf change';
+    END IF;
+    IF old_logic = new_logic THEN
+        RAISE EXCEPTION 'partitioned index logical checksum ignored a leaf change';
+    END IF;
+END;
+$$;
+
 -- Clean up
 DROP TABLE test_partitioned;
 DROP TABLE test_partitioned_nopk;

@@ -4,9 +4,10 @@
  *    Header file for checksum extension for PostgreSQL
  *
  * This extension provides a comprehensive checksum framework for PostgreSQL
- * at various granularity levels: column, tuple, table, index, and database.
- * The implementation uses FNV-1a 32-bit hash algorithm for consistency with
- * PostgreSQL's internal checksum implementation.
+ * at various granularity levels: page, cell, tuple, table, index, and
+ * database.  It also provides a primary-key-free content checksum for tables.
+ * The implementation uses the FNV-1a 32-bit hash algorithm for consistency
+ * with PostgreSQL's internal checksum implementation.
  *
  * CHECKSUM TYPES:
  * 1. Physical Checksums: Depend on physical storage layout
@@ -63,6 +64,7 @@ extern Datum pg_tuple_physical_checksum(PG_FUNCTION_ARGS);
 extern Datum pg_tuple_logical_checksum(PG_FUNCTION_ARGS);
 extern Datum pg_table_physical_checksum(PG_FUNCTION_ARGS);
 extern Datum pg_table_logical_checksum(PG_FUNCTION_ARGS);
+extern Datum pg_table_content_checksum(PG_FUNCTION_ARGS);
 extern Datum pg_index_physical_checksum(PG_FUNCTION_ARGS);
 extern Datum pg_index_logical_checksum(PG_FUNCTION_ARGS);
 extern Datum pg_database_physical_checksum(PG_FUNCTION_ARGS);
