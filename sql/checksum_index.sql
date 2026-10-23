@@ -61,6 +61,14 @@ SELECT
     pg_index_logical_checksum('idx_btree_int'::regclass) != 0 
     AS btree_logical_checksum_valid;
 
+-- Test 2b: logical checksums are available for every index AM
+SELECT
+    pg_index_logical_checksum('idx_hash_text'::regclass) IS NOT NULL AS hash_logical_valid,
+    pg_index_logical_checksum('idx_gist_range'::regclass) IS NOT NULL AS gist_logical_valid,
+    pg_index_logical_checksum('idx_gin_tsvector'::regclass) IS NOT NULL AS gin_logical_valid,
+    pg_index_logical_checksum('idx_spgist_range'::regclass) IS NOT NULL AS spgist_logical_valid,
+    pg_index_logical_checksum('idx_brin_int'::regclass) IS NOT NULL AS brin_logical_valid;
+
 -- Test 3: Hash index physical checksum is non-zero
 SELECT 
     pg_index_physical_checksum('idx_hash_text'::regclass) IS NOT NULL AND

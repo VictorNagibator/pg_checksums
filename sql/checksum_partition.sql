@@ -93,7 +93,7 @@ INSERT INTO test_partitioned_nopk (id, data)
 SELECT gs, 'nopk_' || gs FROM generate_series(1, 99) gs;
 
 SELECT
-    pg_table_logical_checksum('test_partitioned_nopk'::regclass) IS NULL AS partitioned_nopk_logical_null,
+    pg_table_logical_checksum('test_partitioned_nopk'::regclass) IS NOT NULL AS partitioned_nopk_logical_non_null,
     pg_table_physical_checksum('test_partitioned_nopk'::regclass, false) != 0 AS partitioned_nopk_physical_non_zero;
 
 -- Test H: empty partitioned tables
@@ -110,7 +110,7 @@ CREATE TABLE test_partitioned_empty_nopk (
 SELECT
     pg_table_physical_checksum('test_partitioned_empty'::regclass, false) != 0 AS empty_partitioned_physical_non_zero,
     pg_table_logical_checksum('test_partitioned_empty'::regclass) IS NOT NULL AS empty_partitioned_logical_not_null,
-    pg_table_logical_checksum('test_partitioned_empty_nopk'::regclass) IS NULL AS empty_partitioned_nopk_logical_null;
+    pg_table_logical_checksum('test_partitioned_empty_nopk'::regclass) IS NOT NULL AS empty_partitioned_nopk_logical_non_null;
 
 -- Test I: multi-level partitioning
 CREATE TABLE test_partitioned_multi (

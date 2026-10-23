@@ -45,7 +45,7 @@ WHERE without_header != with_header;
 SELECT 
     COUNT(*) = 5 AS all_tuples_have_non_zero_logical_checksum
 FROM (
-    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) AS checksum
+    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid) AS checksum
     FROM test_basic
 ) t
 WHERE checksum IS NOT NULL AND checksum != 0;
@@ -54,23 +54,26 @@ WHERE checksum IS NOT NULL AND checksum != 0;
  t
 (1 row)
 
--- Test D: Logical checksums with header should be different from without header
-SELECT 
-    COUNT(*) = 5 AS header_changes_all_logical_checksums
-FROM (
-    SELECT 
-        pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) AS without_header,
-        pg_tuple_logical_checksum('test_basic'::regclass, ctid, true) AS with_header
-    FROM test_basic
-    WHERE pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) IS NOT NULL
-      AND pg_tuple_logical_checksum('test_basic'::regclass, ctid, true) IS NOT NULL
-) t
-WHERE without_header != with_header;
- header_changes_all_logical_checksums 
---------------------------------------
+-- Test D: identical rows have the same logical checksum regardless of ctid
+CREATE TABLE test_basic_dup (
+    id integer,
+    name text NOT NULL,
+    value float,
+    data bytea
+);
+INSERT INTO test_basic_dup VALUES
+    (4, 'David', 400.0, E'\x12345678'),
+    (4, 'David', 400.0, E'\x12345678');
+SELECT
+    COUNT(DISTINCT pg_tuple_logical_checksum('test_basic_dup'::regclass, ctid)) = 1
+    AS identical_rows_have_same_logical_checksum
+FROM test_basic_dup;
+ identical_rows_have_same_logical_checksum 
+-------------------------------------------
  t
 (1 row)
 
+DROP TABLE test_basic_dup;
 -- Test E: Cell checksums for non-NULL cells should not be -1
 SELECT 
     COUNT(*) = 10 AS non_null_cells_valid
@@ -122,24 +125,21 @@ WHERE checksum1 != checksum2;
  t
 (1 row)
 
--- Test H: Logical checksums for rows with different primary keys should be different
-SELECT 
-    COUNT(*) = 1 AS different_pk_rows_have_different_logical_checksums
+-- Test H: different row contents have different logical checksums
+SELECT
+    COUNT(*) = 1 AS different_rows_have_different_logical_checksums
 FROM (
-    SELECT 
-        pg_tuple_logical_checksum('test_basic'::regclass, t1.ctid, false) AS checksum1,
-        pg_tuple_logical_checksum('test_basic'::regclass, t2.ctid, false) AS checksum2
+    SELECT
+        pg_tuple_logical_checksum('test_basic'::regclass, t1.ctid) AS checksum1,
+        pg_tuple_logical_checksum('test_basic'::regclass, t2.ctid) AS checksum2
     FROM test_basic t1, test_basic t2
-    WHERE t1.id = 4 AND t2.id = 5
-       AND t1.name = t2.name
-       AND t1.value = t2.value
-       AND t1.data = t2.data
+    WHERE t1.id = 1 AND t2.id = 2
 ) t
-WHERE checksum1 IS NOT NULL 
-  AND checksum2 IS NOT NULL 
+WHERE checksum1 IS NOT NULL
+  AND checksum2 IS NOT NULL
   AND checksum1 != checksum2;
- different_pk_rows_have_different_logical_checksums 
-----------------------------------------------------
+ different_rows_have_different_logical_checksums 
+-------------------------------------------------
  t
 (1 row)
 
@@ -184,7 +184,7 @@ DECLARE
     test_passed boolean := false;
 BEGIN
     -- Get original logical checksum
-    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) 
+    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid) 
     INTO old_logical_checksum
     FROM test_basic WHERE id = 1;
     
@@ -192,7 +192,7 @@ BEGIN
     UPDATE test_basic SET value = 999.99 WHERE id = 1;
     
     -- Get new logical checksum
-    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid, false) 
+    SELECT pg_tuple_logical_checksum('test_basic'::regclass, ctid) 
     INTO new_logical_checksum
     FROM test_basic WHERE id = 1;
     

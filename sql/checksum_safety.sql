@@ -23,11 +23,11 @@ CREATE INDEX test_safety_brin ON test_safety_index USING brin (id);
 
 SELECT
     pg_index_logical_checksum('test_safety_btree'::regclass) IS NOT NULL AS btree_logical,
-    pg_index_logical_checksum('test_safety_hash'::regclass) IS NULL AS hash_logical_null,
-    pg_index_logical_checksum('test_safety_gist'::regclass) IS NULL AS gist_logical_null,
-    pg_index_logical_checksum('test_safety_gin'::regclass) IS NULL AS gin_logical_null,
-    pg_index_logical_checksum('test_safety_spgist'::regclass) IS NULL AS spgist_logical_null,
-    pg_index_logical_checksum('test_safety_brin'::regclass) IS NULL AS brin_logical_null;
+    pg_index_logical_checksum('test_safety_hash'::regclass) IS NOT NULL AS hash_logical,
+    pg_index_logical_checksum('test_safety_gist'::regclass) IS NOT NULL AS gist_logical,
+    pg_index_logical_checksum('test_safety_gin'::regclass) IS NOT NULL AS gin_logical,
+    pg_index_logical_checksum('test_safety_spgist'::regclass) IS NOT NULL AS spgist_logical,
+    pg_index_logical_checksum('test_safety_brin'::regclass) IS NOT NULL AS brin_logical;
 
 SELECT
     pg_index_physical_checksum('test_safety_btree'::regclass) IS NOT NULL AS btree_physical,
@@ -96,7 +96,7 @@ SELECT pg_page_checksum('test_safety_page'::regclass, 0) IS NOT NULL AS valid_pa
 -- Test D: out-of-range TIDs are handled without reading out of bounds.
 SELECT
     pg_cell_checksum('test_safety_page'::regclass, '(0,20000)'::tid, 1) IS NULL AS cell_bad_offset_null,
-    pg_tuple_logical_checksum('test_safety_page'::regclass, '(0,20000)'::tid, false) IS NULL AS tuple_logical_bad_offset_null,
+    pg_tuple_logical_checksum('test_safety_page'::regclass, '(0,20000)'::tid) IS NULL AS tuple_logical_bad_offset_null,
     pg_tuple_physical_checksum('test_safety_page'::regclass, '(0,20000)'::tid, false) = 0 AS tuple_physical_bad_offset_zero,
     pg_tuple_physical_checksum('test_safety_page'::regclass, '(1000000,1)'::tid, false) IS NULL AS tuple_physical_bad_block_null;
 
@@ -284,7 +284,7 @@ WHERE c.oid = 'test_safety_toast'::regclass;
 
 SELECT
     pg_database_physical_checksum(false, true) IS NOT NULL AS include_toast_physical,
-    pg_database_logical_checksum(false, true) IS NOT NULL AS include_toast_logical;
+    pg_database_logical_checksum(false, true) IS NOT NULL AS include_indexes_logical;
 
 -- Clean up.
 DROP TABLE test_safety_index;

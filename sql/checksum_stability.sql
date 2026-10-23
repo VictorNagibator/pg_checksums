@@ -38,7 +38,7 @@ CREATE INDEX idx_test_stability_value ON test_checksum_stability (value);
 SELECT 
     'Baseline verification' as test_phase,
     COUNT(*) = 100 as has_100_rows,
-    COUNT(DISTINCT pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false)) = 100 
+    COUNT(DISTINCT pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid)) = 100 
         AS all_logical_checksums_unique,
     pg_table_logical_checksum('test_checksum_stability'::regclass) IS NOT NULL 
         AS table_logical_checksum_not_null,
@@ -51,7 +51,7 @@ CREATE TEMP TABLE baseline_checksums AS
 SELECT 
     id,
     ctid as baseline_ctid,
-    pg_tuple_logical_checksum('test_checksum_stability'::regclass, ctid, false) as baseline_logical
+    pg_tuple_logical_checksum('test_checksum_stability'::regclass, ctid) as baseline_logical
 FROM test_checksum_stability;
 
 -- Phase 1: VACUUM (not FULL)
@@ -61,7 +61,7 @@ VACUUM test_checksum_stability;
 SELECT 
     'After VACUUM (not FULL)' as test_phase,
     COUNT(*) = 100 as all_rows_found,
-    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false) THEN 1 END) = 100
+    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid) THEN 1 END) = 100
         AS all_logical_checksums_match
 FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;
@@ -73,7 +73,7 @@ VACUUM FULL test_checksum_stability;
 SELECT 
     'After VACUUM FULL' as test_phase,
     COUNT(*) = 100 as all_rows_found,
-    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false) THEN 1 END) = 100
+    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid) THEN 1 END) = 100
         AS all_logical_checksums_match
 FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;
@@ -112,7 +112,7 @@ WHERE prev_value IS NOT NULL AND value < prev_value;
 SELECT 
     'After CLUSTER - checksums' as test_phase,
     COUNT(*) = 100 as all_rows_found,
-    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid, false) THEN 1 END) = 100
+    COUNT(CASE WHEN b.baseline_logical = pg_tuple_logical_checksum('test_checksum_stability'::regclass, t.ctid) THEN 1 END) = 100
         AS all_logical_checksums_match
 FROM baseline_checksums b
 JOIN test_checksum_stability t ON b.id = t.id;

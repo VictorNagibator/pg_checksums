@@ -1,7 +1,7 @@
 # pg_checksums.control
 
-comment = 'Checksum functions for PostgreSQL at tuple, column, table, index and database levels'
-default_version = '1.2.0'
+comment = 'Checksum functions for PostgreSQL at page, cell, tuple, table, index and database levels'
+default_version = '1.3.0'
 module_pathname = '$libdir/pg_checksums'
 relocatable = true
 # Creating a C extension that reads relation storage should require a

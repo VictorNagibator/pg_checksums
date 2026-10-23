@@ -22,7 +22,7 @@ SELECT
     pg_table_physical_checksum('test_table_checksum'::regclass, true) != 0 
     AS table_physical_with_header_non_zero;
 
--- Test B: Table logical checksum should be non-zero (table has PK)
+-- Test B: Table logical checksum should be non-zero
 SELECT 
     pg_table_logical_checksum('test_table_checksum'::regclass) IS NOT NULL AND
     pg_table_logical_checksum('test_table_checksum'::regclass) != 0 
@@ -34,7 +34,7 @@ SELECT
     pg_table_physical_checksum('test_table_checksum'::regclass, true) 
     AS header_changes_table_physical_checksum;
 
--- Test D: Empty table physical checksum should be non-zero (based on OID)
+-- Test D: Empty table physical checksum should be non-zero
 CREATE TABLE test_empty_table (id integer);
 SELECT 
     pg_table_physical_checksum('test_empty_table'::regclass, false) != 0 
@@ -42,12 +42,12 @@ SELECT
     pg_table_physical_checksum('test_empty_table'::regclass, true) != 0 
     AS empty_table_physical_with_header_non_zero;
 
--- Test E: Empty table logical checksum should be NULL (no PK)
-SELECT 
-    pg_table_logical_checksum('test_empty_table'::regclass) IS NULL
-    AS empty_table_logical_checksum_null;
+-- Test E: Empty table still has a stable logical checksum
+SELECT
+    pg_table_logical_checksum('test_empty_table'::regclass) IS NOT NULL
+    AS empty_table_logical_checksum_non_null;
 
--- Test F: Table without PK should return NULL for logical checksum
+-- Test F: Table without PK has a logical checksum
 CREATE TABLE test_table_no_pk (
     id integer,
     data text
@@ -56,9 +56,9 @@ CREATE TABLE test_table_no_pk (
 INSERT INTO test_table_no_pk (id, data)
 SELECT gs, 'no_pk_' || gs FROM generate_series(1, 10) gs;
 
-SELECT 
-    pg_table_logical_checksum('test_table_no_pk'::regclass) IS NULL
-    AS table_without_pk_logical_checksum_null;
+SELECT
+    pg_table_logical_checksum('test_table_no_pk'::regclass) IS NOT NULL
+    AS table_without_pk_logical_checksum_non_null;
 
 DROP TABLE test_table_no_pk;
 

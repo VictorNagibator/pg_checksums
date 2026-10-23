@@ -1,0 +1,218 @@
+-- Canonical logical checksum tests (1.3+)
+-- Test A: canonical table checksum does not require a primary key
+CREATE TABLE test_logical_pk (
+    id integer PRIMARY KEY,
+    value integer,
+    label text
+);
+CREATE TABLE test_logical_nopk (
+    id integer,
+    value integer,
+    label text
+);
+INSERT INTO test_logical_pk
+SELECT gs, gs % 7, 'value_' || gs FROM generate_series(1, 100) gs;
+INSERT INTO test_logical_nopk
+SELECT id, value, label FROM test_logical_pk;
+SELECT
+    pg_table_logical_checksum('test_logical_nopk'::regclass) IS NOT NULL
+        AS nopk_logical_non_null,
+    pg_table_logical_checksum('test_logical_pk'::regclass) =
+    pg_table_logical_checksum('test_logical_nopk'::regclass)
+        AS pk_and_nopk_logical_equal;
+ nopk_logical_non_null | pk_and_nopk_logical_equal 
+-----------------------+---------------------------
+ t                     | t
+(1 row)
+
+-- Test B: duplicate rows are preserved (sum + count, not XOR)
+CREATE TABLE test_logical_dup (value text);
+CREATE TABLE test_logical_one (value text);
+INSERT INTO test_logical_dup VALUES ('a'), ('a');
+INSERT INTO test_logical_one VALUES ('a');
+SELECT
+    pg_table_logical_checksum('test_logical_dup'::regclass) <>
+    pg_table_logical_checksum('test_logical_one'::regclass)
+        AS duplicates_change_logical;
+ duplicates_change_logical 
+---------------------------
+ t
+(1 row)
+
+-- Test C: empty tables have a stable logical checksum
+CREATE TABLE test_logical_empty1 (value text);
+CREATE TABLE test_logical_empty2 (value text);
+SELECT
+    pg_table_logical_checksum('test_logical_empty1'::regclass) IS NOT NULL
+        AS empty_logical_non_null,
+    pg_table_logical_checksum('test_logical_empty1'::regclass) =
+    pg_table_logical_checksum('test_logical_empty2'::regclass)
+        AS empty_logical_equal;
+ empty_logical_non_null | empty_logical_equal 
+------------------------+---------------------
+ t                      | t
+(1 row)
+
+-- Test D: numeric scale, enum, composite, array and range values are canonical
+CREATE TYPE test_logical_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE test_logical_pair AS (a integer, b text);
+CREATE TABLE test_logical_types_a (
+    n numeric,
+    m test_logical_mood,
+    p test_logical_pair,
+    a integer[],
+    r int4range
+);
+CREATE TABLE test_logical_types_b (
+    n numeric,
+    m test_logical_mood,
+    p test_logical_pair,
+    a integer[],
+    r int4range
+);
+INSERT INTO test_logical_types_a
+VALUES (1.0, 'ok', ROW(1, 'x')::test_logical_pair,
+        ARRAY[1,2], '[1,3)'::int4range);
+INSERT INTO test_logical_types_b
+VALUES (1.00, 'ok', ROW(1, 'x')::test_logical_pair,
+        ARRAY[1,2], '[1,3)'::int4range);
+SELECT
+    pg_table_logical_checksum('test_logical_types_a'::regclass) =
+    pg_table_logical_checksum('test_logical_types_b'::regclass)
+        AS canonical_types_equal;
+ canonical_types_equal 
+-----------------------
+ t
+(1 row)
+
+-- Test E: index logical checksums work for every access method
+CREATE TABLE test_logical_index (
+    id integer,
+    grp integer,
+    name text,
+    tags text[],
+    doc tsvector,
+    pt point,
+    r int4range
+);
+INSERT INTO test_logical_index
+SELECT gs, gs % 10, 'name' || gs, ARRAY['a' || (gs % 3), 'b'],
+       to_tsvector('simple', 'word' || (gs % 5)),
+       point(gs, gs % 7), int4range(gs, gs + 10)
+FROM generate_series(1, 200) gs;
+CREATE INDEX test_logical_btree ON test_logical_index (name);
+CREATE INDEX test_logical_hash ON test_logical_index USING hash (grp);
+CREATE INDEX test_logical_gist ON test_logical_index USING gist (pt);
+CREATE INDEX test_logical_gin ON test_logical_index USING gin (doc);
+CREATE INDEX test_logical_spgist ON test_logical_index USING spgist (name);
+CREATE INDEX test_logical_brin ON test_logical_index USING brin (grp);
+CREATE INDEX test_logical_expr ON test_logical_index ((grp + 1));
+CREATE INDEX test_logical_partial ON test_logical_index (name) WHERE grp % 2 = 0;
+CREATE INDEX test_logical_include ON test_logical_index (grp) INCLUDE (name);
+SELECT
+    pg_index_logical_checksum('test_logical_btree'::regclass) IS NOT NULL AS btree_ok,
+    pg_index_logical_checksum('test_logical_hash'::regclass) IS NOT NULL AS hash_ok,
+    pg_index_logical_checksum('test_logical_gist'::regclass) IS NOT NULL AS gist_ok,
+    pg_index_logical_checksum('test_logical_gin'::regclass) IS NOT NULL AS gin_ok,
+    pg_index_logical_checksum('test_logical_spgist'::regclass) IS NOT NULL AS spgist_ok,
+    pg_index_logical_checksum('test_logical_brin'::regclass) IS NOT NULL AS brin_ok,
+    pg_index_logical_checksum('test_logical_expr'::regclass) IS NOT NULL AS expr_ok,
+    pg_index_logical_checksum('test_logical_partial'::regclass) IS NOT NULL AS partial_ok,
+    pg_index_logical_checksum('test_logical_include'::regclass) IS NOT NULL AS include_ok;
+ btree_ok | hash_ok | gist_ok | gin_ok | spgist_ok | brin_ok | expr_ok | partial_ok | include_ok 
+----------+---------+---------+--------+-----------+---------+---------+------------+------------
+ t        | t       | t       | t      | t         | t       | t       | t          | t
+(1 row)
+
+-- Test F: logical index checksum is stable across VACUUM and REINDEX
+SELECT pg_index_logical_checksum('test_logical_btree'::regclass) AS before_idx \gset
+VACUUM test_logical_index;
+SELECT pg_index_logical_checksum('test_logical_btree'::regclass) = :before_idx
+    AS stable_after_vacuum;
+ stable_after_vacuum 
+---------------------
+ t
+(1 row)
+
+REINDEX INDEX test_logical_btree;
+SELECT pg_index_logical_checksum('test_logical_btree'::regclass) = :before_idx
+    AS stable_after_reindex;
+ stable_after_reindex 
+----------------------
+ t
+(1 row)
+
+-- Test G: partitioned tables and indexes use the same canonical content
+CREATE TABLE test_logical_part (
+    id integer,
+    grp integer,
+    label text
+) PARTITION BY LIST (grp);
+CREATE TABLE test_logical_part_0 PARTITION OF test_logical_part FOR VALUES IN (0);
+CREATE TABLE test_logical_part_1 PARTITION OF test_logical_part FOR VALUES IN (1);
+CREATE TABLE test_logical_unpart (
+    id integer,
+    grp integer,
+    label text
+);
+INSERT INTO test_logical_part VALUES (1, 0, 'a'), (2, 1, 'b');
+INSERT INTO test_logical_unpart VALUES (1, 0, 'a'), (2, 1, 'b');
+CREATE INDEX test_logical_part_idx ON test_logical_part (label);
+SELECT
+    pg_table_logical_checksum('test_logical_part'::regclass) =
+    pg_table_logical_checksum('test_logical_unpart'::regclass)
+        AS partitioned_logical_equal,
+    pg_index_logical_checksum('test_logical_part_idx'::regclass) IS NOT NULL
+        AS partitioned_index_logical_ok;
+ partitioned_logical_equal | partitioned_index_logical_ok 
+---------------------------+------------------------------
+ t                         | t
+(1 row)
+
+-- Test H: database logical checksum includes tables without PK, serial = parallel
+SELECT pg_database_logical_checksum(false, true) IS NOT NULL
+    AS database_logical_non_null;
+ database_logical_non_null 
+---------------------------
+ t
+(1 row)
+
+DO $$
+DECLARE
+    serial_val bigint;
+    parallel_val bigint;
+BEGIN
+    PERFORM set_config('pg_checksums.workers', '0', true);
+    serial_val := pg_database_logical_checksum(false, true);
+    PERFORM set_config('pg_checksums.workers', '2', true);
+    parallel_val := pg_database_logical_checksum(false, true);
+
+    IF serial_val IS DISTINCT FROM parallel_val THEN
+        RAISE EXCEPTION 'serial and parallel database logical checksums differ';
+    END IF;
+END;
+$$;
+-- Test I: strict mode accepts the new logical format (no skipped relations)
+SET pg_checksums.strict = on;
+SELECT pg_database_logical_checksum(false, true) IS NOT NULL
+    AS strict_logical_non_null;
+ strict_logical_non_null 
+-------------------------
+ t
+(1 row)
+
+RESET pg_checksums.strict;
+-- Clean up
+DROP TABLE test_logical_part;
+DROP TABLE test_logical_unpart;
+DROP TABLE test_logical_index;
+DROP TABLE test_logical_types_a;
+DROP TABLE test_logical_types_b;
+DROP TABLE test_logical_empty1;
+DROP TABLE test_logical_empty2;
+DROP TABLE test_logical_dup;
+DROP TABLE test_logical_one;
+DROP TABLE test_logical_pk;
+DROP TABLE test_logical_nopk;
+DROP TYPE test_logical_pair;
+DROP TYPE test_logical_mood;

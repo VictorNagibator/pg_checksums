@@ -1,5 +1,37 @@
 Revision history for pg_checksums
 
+1.3.0   2026-10-23
+
+    - BREAKING: replace the legacy logical checksum format.  Logical
+      checksums are now canonical, 32-bit values that exclude relation OIDs,
+      heap TIDs and type OIDs.  Enum labels, numeric scale, arrays,
+      composites, domains and ranges are encoded canonically, so identical
+      table content can be compared across databases (same major version and
+      compatible schema/type names).
+    - BREAKING: pg_table_logical_checksum() no longer requires a primary key
+      and no longer mixes the relation OID into the result.  Duplicate rows are
+      preserved by a sum-plus-count aggregate.  Partitioned tables accumulate
+      all leaf rows into the same accumulator.
+    - BREAKING: pg_tuple_logical_checksum() loses the include_header argument.
+      The tuple header is never part of a logical checksum.
+    - BREAKING: pg_index_logical_checksum() is now derived from the visible
+      table rows and the index definition instead of B-tree pages.  It works
+      for every index access method, supports expression, partial, INCLUDE and
+      partitioned indexes, and contains no heap TIDs or dead entries.  A
+      physical index checksum remains the tool for detecting missing/corrupt
+      index entries.
+    - BREAKING: pg_database_logical_checksum(include_system, include_indexes)
+      replaces the old (include_system, include_toast) signature.  It includes
+      tables without primary keys and optionally logical index checksums; TOAST
+      content is covered through the parent table.
+    - Remove pg_table_content_checksum(); pg_table_logical_checksum() now
+      provides the primary-key-free content checksum.
+    - Rework table and database logical aggregates for the canonical format,
+      including parallel workers.  pg_data_checksum() and pg_text_checksum()
+      remain low-level utilities.
+    - Physical checksums are unchanged.  All logical baselines must be
+      recomputed.
+
 1.2.0   2026-10-18
 
     - Add partitioned index support.  pg_index_physical_checksum() and

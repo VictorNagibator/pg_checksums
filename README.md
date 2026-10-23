@@ -19,13 +19,17 @@
 * **Type-Aware**: Full support for all PostgreSQL data types
 * **NULL-Aware**: Special `CHECKSUM_NULL` constant for NULL values
 * **MVCC-Aware**: Incorporates transaction visibility in physical checksums
-* **Primary Key Aware**: Logical checksums use primary keys for row identity
-* **Content Checksums**: `pg_table_content_checksum()` works without a primary
-  key, omits relation OIDs, and preserves duplicate rows with a sum-plus-count
-  aggregate
-* **Parallel Computation**: Table, index, and database checksums can be computed
-  with PostgreSQL parallel workers for faster scans of large relations (the
-  content-only checksum is currently serial)
+* **No Primary Key Required**: Logical table/database checksums hash row
+  content directly and preserve duplicate rows with a sum-plus-count aggregate
+* **Portable Content**: Logical checksums omit relation OIDs, heap TIDs and
+  type OIDs; enum labels, numeric scale, arrays, composites and ranges are
+  canonicalized
+* **All Index Access Methods**: Logical index checksums are derived from table
+  data and the index definition, so B-tree, Hash, GiST, GIN, SP-GiST, BRIN and
+  custom AMs are supported
+* **Parallel Computation**: Table and database checksums can be computed with
+  PostgreSQL parallel workers for faster scans of large relations; logical
+  index checksums are currently serial
 * **Partitioned Support**: Table and index checksums transparently aggregate
   the checksums of all leaf partitions/indexes
 * **Strict Mode**: `pg_checksums.strict` makes database scans fail instead of
@@ -44,15 +48,16 @@
 
 ### Logical Checksums
 
-* **Depend on**: Only logical data content (cell values, primary keys)
-* **Stable across**: Physical reorganization for table-level checksums
-  (`VACUUM FULL`, `CLUSTER`, `REINDEX`)
-* **Useful for**: Logical consistency, replication validation, migration verification
-* **Requires**: Primary keys for tuple/table/database logical checksums
-* **Index caveat**: logical checksums are available for B-tree only.  They
-  include heap TIDs, and database-level logical checksums include indexes, so
-  the database checksum can change when dead index entries are removed by
-  `VACUUM`.  See [Limitations](#limitations-and-portability).
+* **Depend on**: Only logical data content.  Relation OIDs, heap TIDs and
+  type OIDs are excluded.
+* **Stable across**: `VACUUM`, `VACUUM FULL`, `CLUSTER` and `REINDEX`.
+* **Useful for**: Logical consistency, replication validation, migration and
+  cross-database content comparison.
+* **No primary key required**: tables without a PK are covered.
+* **Index checksums**: derived from visible table rows and the index
+  definition, not from physical index pages.  This works for every index AM
+  and is stable across `VACUUM`/`REINDEX`.  Physical index checksums remain
+  the tool for detecting missing or corrupt index entries.
 
 ---
 
@@ -163,16 +168,16 @@ SELECT pg_tuple_physical_checksum('orders'::regclass, ctid, true)
 FROM orders WHERE order_id = 123;
 ```
 
-**`pg_tuple_logical_checksum(regclass, tid, boolean) -> integer`**
+**`pg_tuple_logical_checksum(regclass, tid) -> integer`**
 
-Computes logical tuple checksum based on primary key values and data content. Returns NULL if no PK.
-Requires `SELECT`; relations protected by row-level security are rejected.
-Note that `include_header = true` includes the tuple header (xmin/xmax/ctid),
-so that variant is not stable across physical reorganization.
+Computes a canonical logical checksum of one row.  All non-dropped columns are
+hashed; relation OIDs, heap TIDs and the tuple header are excluded.  No primary
+key is required.  Requires `SELECT`; relations protected by row-level security
+are rejected.
 
 ```sql
--- Logical checksum (requires primary key)
-SELECT pg_tuple_logical_checksum('customers'::regclass, ctid, false) 
+-- Logical checksum of one row
+SELECT pg_tuple_logical_checksum('customers'::regclass, ctid)
 FROM customers WHERE customer_id = 456;
 ```
 
@@ -203,47 +208,28 @@ SELECT pg_table_physical_checksum('inventory'::regclass, true);
 
 **`pg_table_logical_checksum(regclass) -> bigint`**
 
-Aggregates logical tuple checksums for entire table. Requires primary key.
-Requires `SELECT` on the table; returns NULL for a TOAST relation (toast
-content is covered when the parent table detoasts its values).
+Aggregates canonical logical row checksums for an entire table.  It does not
+require a primary key, and relation OIDs are not included.  Duplicate rows are
+preserved by a sum-plus-count aggregate, so two identical rows contribute
+twice.  Requires `SELECT` on the table; returns NULL for a TOAST relation
+(toast content is covered when the parent table detoasts its values).
 
 ```sql
--- Table logical checksum (requires PK)
+-- Logical checksum (no primary key required)
 SELECT pg_table_logical_checksum('products'::regclass);
 ```
 
-**`pg_table_content_checksum(regclass) -> bigint`**
-
-Computes a content-only checksum without requiring a primary key.  It hashes
-all column values of every visible row and combines them with a
-sum-plus-count aggregate, so duplicate rows change the result (pure XOR would
-cancel them).  The accumulator is 64-bit, while each row's content hash is
-32-bit.  It does **not** include relation OIDs, which makes it suitable for
-comparing a table's content across databases; partitioned tables accumulate
-all leaf rows into the same accumulator, so the result does not depend on the
-partitioning layout.
-
-```sql
--- Works for tables without a primary key
-SELECT pg_table_content_checksum('event_log'::regclass);
-```
-
-The content checksum is currently computed serially; it does not use
-`pg_checksums.workers`.
-
-**Partitioned tables**: `pg_table_physical_checksum`,
-`pg_table_logical_checksum` and `pg_table_content_checksum` accept
-partitioned tables. Since a partitioned table has no storage of its own, the
-extension recurses into every leaf partition. Logical checksums require the
-primary key to be defined on the partitioned table (partitions inherit it);
-the content checksum has no such requirement. Nested (multi-level)
-partitioning is supported as well.
+**Partitioned tables**: `pg_table_physical_checksum` and
+`pg_table_logical_checksum` accept partitioned tables. Since a partitioned
+table has no storage of its own, the extension recurses into every leaf
+partition.  Logical checksums accumulate all leaf rows into the same
+accumulator, so the result does not depend on the partitioning layout.
+Nested (multi-level) partitioning is supported as well.
 
 ```sql
 -- Checksum a partitioned table (recurses into all partitions)
 SELECT pg_table_physical_checksum('sales'::regclass, false);
 SELECT pg_table_logical_checksum('sales'::regclass);
-SELECT pg_table_content_checksum('sales'::regclass);
 ```
 
 ### Index Level Functions
@@ -262,21 +248,21 @@ SELECT pg_index_physical_checksum('idx_product_name'::regclass);
 
 **`pg_index_logical_checksum(regclass) -> integer`**
 
-Computes logical checksum of index key values. Stable across REINDEX with the
-same data.
-
-**B-tree only.**  Hash, GiST, GIN, SP-GiST and BRIN pages do not contain
-ordinary index tuples; trying to interpret them produced meaningless values
-and, for SP-GiST, a server crash.  Those access methods now return NULL for
-the logical checksum (physical checksums remain available).  The checksum
-includes heap TIDs, so it changes when heap tuples move (for example after
-`CLUSTER` or `VACUUM FULL`).  A partitioned B-tree index aggregates the
-logical checksums of its leaf indexes.
+Computes the logical content of an index from the visible table rows and the
+index definition.  Plain columns, expressions, partial-index predicates and
+INCLUDE columns are evaluated for each row; no heap TIDs, relation OIDs or dead
+entries are included.  It works for every index access method (B-tree, Hash,
+GiST, GIN, SP-GiST, BRIN and custom AMs), and for partitioned indexes.
 
 ```sql
--- Logical checksum of a B-tree index
+-- Logical content of any index
 SELECT pg_index_logical_checksum('idx_product_name'::regclass);
 ```
+
+**Logical vs physical index checksums.**  The logical checksum describes what
+the index should contain from the table data; it does not inspect physical
+index pages.  A missing or corrupt index entry is therefore detected by
+`pg_index_physical_checksum`, not by the logical value.
 
 ### Database Level Functions (Superuser Only)
 
@@ -317,20 +303,22 @@ aborted.  Run with `pg_checksums.workers = 0` (the default) to get the
 skip-with-warning behavior on PostgreSQL 12-16.  Serial scans and parallel
 scans on PostgreSQL 17+ isolate errors as described above.
 
-**`pg_database_logical_checksum(boolean, boolean) -> bigint`**
+**`pg_database_logical_checksum(include_system boolean, include_indexes boolean) -> bigint`**
 
-Aggregates logical relation checksums for entire database. Skips tables without PK.
-Superuser-only (enforced in C).  TOAST relations are skipped: their content is
-covered when the parent table detoasts the values.
+Aggregates canonical logical checksums for the database.  Tables without a
+primary key are included.  TOAST relations are skipped: their content is
+covered when the parent table detoasts the values.  `include_indexes`
+(default true) controls whether logical index checksums are included; because
+they are derived from table data, they do not change when dead index entries
+are vacuumed.
 
-Because the database logical checksum includes indexes, and logical index
-checksums include heap TIDs and currently visible index entries, the database
-checksum can change when dead index entries are removed by `VACUUM`.  Use
-table-level logical checksums when you need a pure content fingerprint; see
-[Limitations](#limitations-and-portability).
+Superuser-only (enforced in C).
 
 ```sql
--- Database logical checksum
+-- Database logical checksum, including indexes
+SELECT pg_database_logical_checksum(false, true);
+
+-- Tables only
 SELECT pg_database_logical_checksum(false, false);
 ```
 
@@ -379,85 +367,79 @@ CHECKSUM_NULL = 0xFFFFFFFF (signed -1)
 
 ### Order-Independent Aggregation
 
-For table, index, and database checksums, the extension uses an order-independent aggregate so that the result does not depend on scan order:
+Physical and index aggregates use XOR, which is commutative and associative and
+therefore independent of scan order and partition boundaries.
 
-1. Collect all individual checksums
-2. Fold each through a 32-bit (or 64-bit) avalanche finalizer
-3. Combine them with XOR
-
-XOR is both commutative and associative, which makes the aggregate not only order-independent but also partition-independent. This is what allows a single backend and any number of parallel workers to produce byte-for-byte identical results without extra coordination.
+Logical table/database aggregates use a **sum plus count** instead.  Addition
+is still order-independent, but the count preserves duplicate rows, which a
+pure XOR would cancel.  Parallel workers combine their partial sums and counts
+before the final 32-bit mix, so serial and parallel results are identical.
 
 ### Type-Specific Handling
 
-The extension properly handles all PostgreSQL type categories:
+Logical values use a canonical type-aware encoding:
 
-* **Pass-by-value types** (int4, float8, bool): Binary representation hashed
-* **Varlena types** (text, bytea): Detoasted and entire structure hashed
-* **C-string types**: Null-terminated string hashed
-* **Pass-by-reference types**: Pointer dereferenced and data hashed
+* **Scalar types** use their binary send function (network byte order), or the
+  output function when no send function exists.
+* **Enums** are hashed by label, not by type OID.
+* **numeric** is normalized with `numeric_normalize()`, so `1.0` and `1.00`
+  compare equal.
+* **Arrays, composites, domains and ranges** are traversed recursively, so
+  embedded type OIDs are not part of the hash.
+* **Floating point** canonicalizes NaN and negative zero.
 
 ---
 
 ## Limitations and Portability
 
-These limitations are documented rather than silently ignored; several of them
-will be addressed by the planned checksum-format (pg_checksums v2).
+These limitations are documented rather than silently ignored.
 
-* **Not fully portable between databases.** Table, partition and database
-  logical checksums mix relation OIDs into the result, and enum/composite/array
-  values include type OIDs.  `pg_table_content_checksum()` omits relation
-  OIDs and is a better fit for cross-database content comparison, but the
-  type-level caveats below still apply.
-* **Not canonical for every type.** `numeric` values with different display
-  scale (for example `1.0` and `1.00`) are SQL-equal but hash differently;
-  composite and array values include type OIDs; pass-by-value hashes use the
-  native byte order.
+* **Portability is scoped.** Logical checksums exclude relation OIDs, heap
+  TIDs and type OIDs.  Built-in types, enums, numeric, arrays, composites,
+  domains and ranges use a canonical encoding.  Cross-database comparison is
+  intended for the same PostgreSQL major version and compatible schema/type
+  names; custom types whose send/output representation changes between
+  versions may still produce different values.
+* **Custom types are type-defined.** A user-defined type is hashed through its
+  binary send function, or its output function when no send function exists.
+  If that representation differs between databases, the checksum differs.
 * **Physical checksums are not replica fingerprints.** Tuple/table physical
   checksums depend on tuple locations, MVCC fields, tuple bytes and the
   relation's relfilenode/reltablespace; index physical checksums hash raw
-  index pages, including page LSNs.  A standby, a restored backup or a table
-  re-created with the same data usually produces different physical
-  checksums.  Planner statistics are not part of the checksum, so `ANALYZE`
-  does not change it; use physical checksums to detect on-disk corruption
-  within one cluster, not to compare replicas.
-* **Logical index checksums are B-tree only.**  For B-tree they include heap
-  TIDs, and they currently include index entries that are not yet removed by
-  `VACUUM` (including entries from aborted transactions).  Database logical
-  checksums include indexes, so they can change after `VACUUM` even though the
-  logical table contents did not.
-* **Tables without a primary key are skipped** by logical table and database
-  checksums.  Their indexes are still included, which makes the database
-  checksum change on vacuum and TID movement without covering the table data.
-  Use `pg_table_content_checksum()` for those tables; the content checksum
-  needs no primary key.
-* **Coverage gaps.**  The database physical checksum does not include TOAST
+  index pages, including page LSNs.  Use physical checksums for on-disk
+  corruption within one cluster, not for comparing replicas.
+* **Logical index checksums describe expected content, not stored pages.**
+  They are derived from visible table rows and the index definition, so a
+  missing or corrupt index entry is not detected by this value.  Use
+  `pg_index_physical_checksum` for actual index storage.
+* **Coverage gaps.** The database physical checksum does not include TOAST
   content by default, and never includes sequences, large objects (unless
   `include_system = true`), FSM/VM forks or relation free space.  Foreign
   table partitions are skipped by partitioned table checksums because they
   have no local storage in this database.
-* **Content checksums are serial.**  `pg_table_content_checksum()` does not
-  use `pg_checksums.workers` yet; it scans the table in the calling backend.
-* **32-bit content hashes.**  The existing table and index logical functions
-  return a 64-bit value whose content component is 32 bits.
-  `pg_table_content_checksum()` returns a 64-bit aggregate, but each row's
-  content hash is still 32 bits.  This is adequate for accidental corruption
-  detection but not for cryptographic tamper evidence; FNV-1a is not a
-  cryptographic hash.
-* **The existing logical aggregates are XOR-based.**  XOR is order-independent
-  and parallel-safe, but it can mask duplicate entries.
-  `pg_table_content_checksum()` uses a sum-plus-count aggregate instead; a
-  similar v2 algorithm for the existing table/index functions is planned.
+* **Logical index checksums are serial.** `pg_index_logical_checksum` scans the
+  table and evaluates the index definition in the calling backend; it does not
+  use `pg_checksums.workers` yet.  Table and database logical checksums are
+  parallel.
+* **32-bit hashes.** All logical checksums are 32-bit.  This is adequate for
+  accidental corruption detection but not for cryptographic tamper evidence;
+  FNV-1a is not a cryptographic hash.
+* **RLS and column privileges.** Relations protected by row-level security are
+  rejected because a direct heap scan cannot apply policies.  Table-level
+  `SELECT` is required; column-only privileges are not sufficient.
+* **Foreign tables.** Foreign partitions/tables have no local storage and are
+  skipped by partitioned checksums.
 
 ---
 
 ## Parallel Computation
 
-Table, index, and database checksums can be computed in parallel using
-PostgreSQL's parallel worker infrastructure. Each worker scans a subset of
-the relation's blocks (or a subset of the database's relations) using a
-shared, self-balancing atomic counter, and the partial results are combined
-by the leader.  `pg_table_content_checksum()` is the exception: it currently
-runs serially.
+Table and database checksums can be computed in parallel using PostgreSQL's
+parallel worker infrastructure. Each worker scans a subset of the relation's
+blocks (or a subset of the database's relations) using a shared,
+self-balancing atomic counter, and the partial results are combined by the
+leader.  Logical index checksums are currently serial because they evaluate
+the index definition while scanning the table.
 
 ### Configuration
 
@@ -484,17 +466,17 @@ RESET pg_checksums.workers;
 
 ### Strict mode
 
-Database checksum functions normally skip relations that cannot be
-checksummed: tables without a primary key in logical mode, unsupported index
-access methods, or relations that fail during the scan.  Set
-`pg_checksums.strict = on` to turn those cases into an error instead:
+Database checksum functions normally skip a relation that cannot be
+checksummed (for example an invalid index, a foreign partition, or a relation
+that fails during the scan).  Tables without a primary key and all index
+access methods are now supported, so they are not skipped.  Set
+`pg_checksums.strict = on` to turn an actual skip into an error instead:
 
 ```sql
 SET pg_checksums.strict = on;
-SELECT pg_database_logical_checksum(false, false);
--- ERROR: relation "event_log" cannot be checksummed
--- DETAIL: The relation has no usable checksum (missing primary key,
--- unsupported index access method, or a scan error).
+SELECT pg_database_logical_checksum(false, true);
+-- ERROR: relation "..." cannot be checksummed
+-- DETAIL: The relation has no usable checksum.
 ```
 
 The default is `off`.  In strict mode a skipped relation aborts the whole
@@ -562,13 +544,13 @@ ORDER BY c.relname;
 ### 3. Data Migration Verification
 
 ```sql
--- Verify migration integrity.  pg_table_content_checksum() omits relation OIDs,
--- so values are comparable between the source and target databases.
+-- Verify migration integrity.  Logical checksums omit relation OIDs and heap
+-- TIDs, so values are comparable between source and target databases.
 -- Run this query on both databases and compare the two result sets.
 WITH table_checksums AS (
     SELECT
         c.relname,
-        pg_table_content_checksum(c.oid) AS checksum
+        pg_table_logical_checksum(c.oid) AS checksum
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'public'
@@ -636,7 +618,7 @@ EXECUTE FUNCTION audit_table_changes();
 -- Verify restored database matches expected state
 SELECT 
     'Restored DB' as source,
-    pg_database_logical_checksum(false, false) as checksum
+    pg_database_logical_checksum(false, true) as checksum
 UNION ALL
 SELECT 
     'Backup timestamp ' || backup_time,
@@ -689,18 +671,22 @@ on Linux, macOS, and Windows.
 4. MVCC behavior and concurrency
 5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
 6. Error conditions and edge cases
-7. Parallel vs serial checksum consistency at the table, index, and database levels
-8. Partitioned tables (single- and multi-level, with and without primary keys)
-9. Safety and validation: non-B-tree logical index checksums return NULL,
-   invalid block numbers/TIDs are rejected, views/sequences/indexes are
-   rejected by table functions, SELECT privileges and RLS are enforced, and
-   TOAST physical checksums are computed from raw pages
+7. Parallel vs serial checksum consistency at the table and database levels
+   (logical index checksums are currently serial)
+8. Partitioned tables and indexes (single- and multi-level, with and without
+   primary keys)
+9. Safety and validation: logical index checksums work for every access
+   method; invalid block numbers/TIDs are rejected; views/sequences/indexes
+   are rejected by table functions; SELECT privileges and RLS are enforced;
+   and TOAST physical checksums are computed from raw pages
 10. Corrupt page handling: unsafe page headers and line pointers produce clean
     errors; database scans skip the affected relation with a warning
 11. Partitioned index aggregation, including deterministic physical and
-    logical checksums for partitioned B-tree indexes
-12. `pg_table_content_checksum()`: no-PK tables, duplicate rows, empty and
-    partitioned tables, TOAST parents, and `pg_checksums.strict`
+    logical checksums for partitioned indexes
+12. Canonical logical checksums: no-PK tables, duplicate rows, empty and
+    partitioned tables, enum/numeric/array/composite/range values, all index
+    AMs, expression/partial/INCLUDE indexes, and serial/parallel database
+    consistency
 
 ---
 
@@ -773,8 +759,8 @@ So bump the version in `pg_checksums.control`, `META.json` and `Changes`, add
 the new SQL script (and an upgrade script if needed), and only then tag:
 
 ```bash
-git tag -a v1.2.0 -m "pg_checksums 1.2.0"
-git push origin v1.2.0
+git tag -a v1.3.0 -m "pg_checksums 1.3.0"
+git push origin v1.3.0
 ```
 
 ---

@@ -56,7 +56,7 @@ sub test_vacuum_stability {
     my $orig_tuples = $node->safe_psql('postgres',
         "SELECT id, ctid,
                 pg_tuple_physical_checksum('test_vacuum_stability'::regclass, ctid, false) as phys,
-                pg_tuple_logical_checksum('test_vacuum_stability'::regclass, ctid, false) as logic
+                pg_tuple_logical_checksum('test_vacuum_stability'::regclass, ctid) as logic
          FROM test_vacuum_stability WHERE id IN (1, 500, 1000) ORDER BY id");
     
     my $orig_table_phys = $node->safe_psql('postgres',
@@ -98,7 +98,7 @@ sub test_vacuum_stability {
     my $after_vacuum_full_tuples = $node->safe_psql('postgres',
         "SELECT id, ctid,
                 pg_tuple_physical_checksum('test_vacuum_stability'::regclass, ctid, false) as phys,
-                pg_tuple_logical_checksum('test_vacuum_stability'::regclass, ctid, false) as logic
+                pg_tuple_logical_checksum('test_vacuum_stability'::regclass, ctid) as logic
          FROM test_vacuum_stability WHERE id IN (1, 500, 1000) ORDER BY id");
     
     my $after_vacuum_full_table_phys = $node->safe_psql('postgres',
@@ -191,7 +191,7 @@ sub test_cluster_stability {
         my $row = $node->safe_psql('postgres',
             "SELECT ctid,
                     pg_tuple_physical_checksum('test_cluster_stability'::regclass, ctid, false) as phys,
-                    pg_tuple_logical_checksum('test_cluster_stability'::regclass, ctid, false) as logic
+                    pg_tuple_logical_checksum('test_cluster_stability'::regclass, ctid) as logic
              FROM test_cluster_stability WHERE id = $id");
         push @orig_rows, { id => $id, row => $row };
     }
@@ -221,7 +221,7 @@ sub test_cluster_stability {
         my $after_row = $node->safe_psql('postgres',
             "SELECT ctid,
                     pg_tuple_physical_checksum('test_cluster_stability'::regclass, ctid, false) as phys,
-                    pg_tuple_logical_checksum('test_cluster_stability'::regclass, ctid, false) as logic
+                    pg_tuple_logical_checksum('test_cluster_stability'::regclass, ctid) as logic
              FROM test_cluster_stability WHERE id = $id");
         
         my ($after_ctid, $after_phys, $after_logic) = split(/\|/, $after_row);
@@ -395,7 +395,7 @@ sub test_comprehensive_stability {
         my $row = $node->safe_psql('postgres',
             "SELECT ctid,
                     pg_tuple_physical_checksum('test_comprehensive'::regclass, ctid, false) as phys,
-                    pg_tuple_logical_checksum('test_comprehensive'::regclass, ctid, false) as logic
+                    pg_tuple_logical_checksum('test_comprehensive'::regclass, ctid) as logic
              FROM test_comprehensive WHERE id = $id");
         
         $orig_row_checksums{$id} = $row;
@@ -466,7 +466,7 @@ sub test_comprehensive_stability {
         my $current_row = $node->safe_psql('postgres',
             "SELECT ctid,
                     pg_tuple_physical_checksum('test_comprehensive'::regclass, ctid, false) as phys,
-                    pg_tuple_logical_checksum('test_comprehensive'::regclass, ctid, false) as logic
+                    pg_tuple_logical_checksum('test_comprehensive'::regclass, ctid) as logic
              FROM test_comprehensive WHERE id = $id");
         
         if ($current_row ne '') {

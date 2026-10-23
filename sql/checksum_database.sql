@@ -179,36 +179,32 @@ BEGIN
 END;
 $$;
 
--- Test G: Database logical checksum for table without PK should skip that table
+-- Test G: a table without a primary key participates in the database
+-- logical checksum, so adding one must change the result.
 DO $$
 DECLARE
     logical_checksum_before bigint;
     logical_checksum_after bigint;
 BEGIN
-    -- Get current logical checksum
     logical_checksum_before := pg_database_logical_checksum(false, false);
-    
-    -- Create a table without primary key
+
     CREATE TABLE test_checksum_schema.table_no_pk (
         id integer,
         data text
     );
-    
+
     INSERT INTO test_checksum_schema.table_no_pk (id, data)
     SELECT gs, 'no_pk_' || gs FROM generate_series(1, 20) gs;
-    
-    -- Get logical checksum after adding table without PK
+
     logical_checksum_after := pg_database_logical_checksum(false, false);
-    
-    -- Clean up
+
     DROP TABLE test_checksum_schema.table_no_pk;
-    
-    -- Logical checksum should remain the same (table without PK is skipped)
+
     IF logical_checksum_before = logical_checksum_after THEN
-        RAISE NOTICE 'Test G passed: Table without PK does not affect logical checksum';
-    ELSE
-        RAISE NOTICE 'Test G: Logical checksum changed after adding table without PK (unexpected)';
+        RAISE EXCEPTION 'Test G failed: table without PK did not affect logical checksum';
     END IF;
+
+    RAISE NOTICE 'Test G passed: table without PK affects logical checksum';
 END;
 $$;
 

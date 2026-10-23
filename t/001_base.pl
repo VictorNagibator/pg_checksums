@@ -47,9 +47,9 @@ sub test_tuple_checksum_basic {
     ok(checksum_is_valid($checksums_physical[1]), 'second tuple physical checksum is valid');
     isnt($checksums_physical[0], $checksums_physical[1], 'different tuples have different physical checksums');
     
-    # Get logical checksums for all tuples (requires PK)
+    # Get logical checksums for all tuples (no PK required)
     my $result_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_tuple'::regclass, ctid, false) FROM test_tuple ORDER BY id");
+        "SELECT pg_tuple_logical_checksum('test_tuple'::regclass, ctid) FROM test_tuple ORDER BY id");
     
     my @checksums_logical = split(/\n/, $result_logical);
     
@@ -66,13 +66,14 @@ sub test_tuple_checksum_basic {
     
     isnt($checksum_without_physical, $checksum_with_physical, 'physical checksum with header differs from without header');
     
-    # Test with and without header (logical)
+    # Logical checksum is stable across repeated calls
     my $checksum_without_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_tuple'::regclass, ctid, false) FROM test_tuple WHERE id = 1");
-    my $checksum_with_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_tuple'::regclass, ctid, true) FROM test_tuple WHERE id = 1");
-    
-    isnt($checksum_without_logical, $checksum_with_logical, 'logical checksum with header differs from without header');
+        "SELECT pg_tuple_logical_checksum('test_tuple'::regclass, ctid) FROM test_tuple WHERE id = 1");
+    my $checksum_logical_again = $node->safe_psql('postgres',
+        "SELECT pg_tuple_logical_checksum('test_tuple'::regclass, ctid) FROM test_tuple WHERE id = 1");
+
+    is($checksum_without_logical, $checksum_logical_again,
+       'logical checksum is stable across repeated calls');
     
     # Test physical vs logical are different
     isnt($checksum_without_physical, $checksum_without_logical, 'physical and logical checksums are different');
@@ -143,25 +144,27 @@ sub test_table_checksum_basic {
     # Test physical vs logical are different
     isnt($checksum_without_physical, $checksum_logical, 'table physical and logical checksums are different');
     
-    # Test table without PK - logical checksum should be NULL
+    # Test table without PK - logical checksum is supported
     $node->safe_psql('postgres', 'CREATE TABLE test_table_no_pk (id int, data text)');
     $node->safe_psql('postgres',
         "INSERT INTO test_table_no_pk SELECT gs, 'data_' || gs FROM generate_series(1, 5) gs");
-    
+
     my $checksum_no_pk_logical = $node->safe_psql('postgres',
         "SELECT pg_table_logical_checksum('test_table_no_pk'::regclass)");
-    is($checksum_no_pk_logical, '', 'table without PK returns NULL for logical checksum');
-    
-    # Empty table physical checksum should be non-zero (based on OID)
+    ok(checksum_is_valid($checksum_no_pk_logical),
+       'table without PK has a logical checksum');
+
+    # Empty table physical checksum should be non-zero
     $node->safe_psql('postgres', 'CREATE TABLE empty_table (id int)');
     my $empty_checksum_physical = $node->safe_psql('postgres',
         "SELECT pg_table_physical_checksum('empty_table'::regclass, false)");
     ok(checksum_is_valid($empty_checksum_physical), 'empty table physical checksum is valid');
-    
-    # Empty table without PK - logical checksum should be NULL
+
+    # Empty table logical checksum is a stable non-zero value
     my $empty_checksum_logical = $node->safe_psql('postgres',
         "SELECT pg_table_logical_checksum('empty_table'::regclass)");
-    is($empty_checksum_logical, '', 'empty table without PK returns NULL for logical checksum');
+    ok(checksum_is_valid($empty_checksum_logical),
+       'empty table has a logical checksum');
     
     $node->safe_psql('postgres', 'DROP TABLE test_table_pk, test_table_no_pk, empty_table');
 }
@@ -260,11 +263,12 @@ sub test_database_checksum_basic {
     
     ok(checksum_is_valid($db_checksum_physical), 'database physical checksum is valid and non-zero');
     
-    # Get database logical checksum (all tables have PK)
+    # Get database logical checksum (tables only)
     my $db_checksum_logical = $node->safe_psql('postgres',
         "SELECT pg_database_logical_checksum(false, false)");
-    
-    ok(checksum_is_valid($db_checksum_logical), 'database logical checksum is valid and non-zero (all tables have PK)');
+
+    ok(checksum_is_valid($db_checksum_logical),
+       'database logical checksum is valid and non-zero');
     isnt($db_checksum_physical, $db_checksum_logical, 'database physical and logical checksums are different');
     
     # Database physical checksum should change when data changes
@@ -305,7 +309,7 @@ sub test_checksum_detects_corruption {
     my $orig_tuple_physical = $node->safe_psql('postgres',
         "SELECT pg_tuple_physical_checksum('test_corrupt'::regclass, ctid, false) FROM test_corrupt");
     my $orig_tuple_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_corrupt'::regclass, ctid, false) FROM test_corrupt");
+        "SELECT pg_tuple_logical_checksum('test_corrupt'::regclass, ctid) FROM test_corrupt");
     my $orig_col1 = $node->safe_psql('postgres',
         "SELECT pg_cell_checksum('test_corrupt'::regclass, ctid, 2) FROM test_corrupt");
     my $orig_col2 = $node->safe_psql('postgres',
@@ -319,7 +323,7 @@ sub test_checksum_detects_corruption {
     my $new_tuple_physical = $node->safe_psql('postgres',
         "SELECT pg_tuple_physical_checksum('test_corrupt'::regclass, ctid, false) FROM test_corrupt");
     my $new_tuple_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_corrupt'::regclass, ctid, false) FROM test_corrupt");
+        "SELECT pg_tuple_logical_checksum('test_corrupt'::regclass, ctid) FROM test_corrupt");
     my $new_col1 = $node->safe_psql('postgres',
         "SELECT pg_cell_checksum('test_corrupt'::regclass, ctid, 2) FROM test_corrupt");
     my $new_col2 = $node->safe_psql('postgres',
@@ -382,7 +386,7 @@ sub test_mvcc_checksum_behavior {
     my $initial_checksum_physical = $node->safe_psql('postgres',
         "SELECT pg_tuple_physical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     my $initial_checksum_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
+        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid) FROM test_mvcc");
     
     ok(checksum_is_valid($initial_checksum_physical), 'initial physical checksum valid');
     ok(checksum_is_valid($initial_checksum_logical), 'initial logical checksum valid');
@@ -395,7 +399,7 @@ sub test_mvcc_checksum_behavior {
     my $updated_checksum_physical = $node->safe_psql('postgres',
         "SELECT pg_tuple_physical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     my $updated_checksum_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
+        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid) FROM test_mvcc");
     
     # Both checksums should change because data changed
     isnt($initial_checksum_physical, $updated_checksum_physical, 
@@ -410,7 +414,7 @@ sub test_mvcc_checksum_behavior {
     my $restored_checksum_physical = $node->safe_psql('postgres',
         "SELECT pg_tuple_physical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     my $restored_checksum_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
+        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid) FROM test_mvcc");
     
     # Physical checksum should differ (different MVCC info, possibly different ctid)
     isnt($initial_checksum_physical, $restored_checksum_physical, 
@@ -427,7 +431,7 @@ sub test_mvcc_checksum_behavior {
     my $same_data_checksum_physical = $node->safe_psql('postgres',
         "SELECT pg_tuple_physical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
     my $same_data_checksum_logical = $node->safe_psql('postgres',
-        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid, false) FROM test_mvcc");
+        "SELECT pg_tuple_logical_checksum('test_mvcc'::regclass, ctid) FROM test_mvcc");
     
     # Physical checksum may change (new MVCC version)
     # Logical checksum should remain the same (data unchanged)

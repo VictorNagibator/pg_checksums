@@ -16,7 +16,7 @@ EXTVERSION = $(shell sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\([^']*
 # Every versioned install script and every upgrade script between them.
 DATA = $(wildcard $(EXTENSION)--*.sql)
 
-REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition checksum_safety checksum_content
+REGRESS = checksum_basic checksum_database checksum_index checksum_table checksum_stability checksum_parallel checksum_partition checksum_safety checksum_logical
 REGRESS_OPTS = \
     --inputdir=./ \
     --load-extension=pg_checksums
