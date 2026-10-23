@@ -326,20 +326,37 @@ typedef struct ChecksumLogicalAccum
 } ChecksumLogicalAccum;
 
 /*
+ * IndexLogicalScanState - executor state shared by a block range scan
+ */
+typedef struct IndexLogicalScanState
+{
+    Relation    idxRel;
+    Relation    heapRel;
+    IndexInfo  *indexInfo;
+    EState     *estate;
+    ExprContext *econtext;
+    ExprState  *predicate;
+    TupleTableSlot *slot;
+    MemoryContext context;
+    Snapshot    snapshot;
+    Datum      *values;
+    bool       *nulls;
+    int         nattrs;
+} IndexLogicalScanState;
+
+/*
  * ChecksumWorkerResult - fixed-size result returned by each worker
  *
  * Each worker writes a single entry of this type into shared memory, so
  * no streaming or variable-sized shared memory is required. For 32-bit
  * scans partial holds the uint32 aggregate zero-extended to 64 bits.
- * found_invalid is set only by logical table scans to report a tuple with
- * a NULL primary key value.  had_error is set by database scans when one or
- * more relations had to be skipped.
+ * had_error is set by database scans when one or more relations had to be
+ * skipped.
  */
 typedef struct ChecksumWorkerResult
 {
     uint64      partial;
     uint64      count;
-    bool        found_invalid;
     bool        had_error;
 } ChecksumWorkerResult;
 
@@ -351,6 +368,7 @@ typedef enum ChecksumTaskType
     CHECKSUM_TASK_TABLE_PHYSICAL = 1,
     CHECKSUM_TASK_TABLE_LOGICAL,
     CHECKSUM_TASK_INDEX_PHYSICAL,
+    CHECKSUM_TASK_INDEX_LOGICAL,
     CHECKSUM_TASK_DATABASE_PHYSICAL,
     CHECKSUM_TASK_DATABASE_LOGICAL
 } ChecksumTaskType;
@@ -378,8 +396,6 @@ typedef struct ChecksumParallelState
     ChecksumTaskType task_type;
     Oid         reloid;
     bool        include_header;
-    bool        include_system;
-    bool        include_toast;
     uint32      nitems;
     uint32      snapshot_size;
     pg_atomic_uint32 next_item;
@@ -442,6 +458,12 @@ static void pg_index_logical_checksum_accum(Oid indexoid,
                                               bool check_privileges,
                                               ChecksumLogicalAccum *acc,
                                               bool *is_null);
+static bool pg_index_logical_scan_init(Oid indexoid, Snapshot snapshot,
+                                       IndexLogicalScanState *scanstate);
+static void pg_index_logical_scan_blocks(IndexLogicalScanState *scanstate,
+                                         BlockNumber start, BlockNumber end,
+                                         ChecksumLogicalAccum *acc);
+static void pg_index_logical_scan_end(IndexLogicalScanState *scanstate);
 
 static uint32 hash_mix32(uint32 h);
 static uint64 hash_mix64(uint64 h);
@@ -482,8 +504,6 @@ static void pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type,
                                               ChecksumAccum *acc,
                                               ChecksumLogicalAccum *logical_acc);
 static void pg_checksums_parallel_scan_database(bool physical,
-                                                bool include_system,
-                                                bool include_toast,
                                                 ChecksumRelationItem *items,
                                                 uint32 nitems, int workers,
                                                 ChecksumAccum64 *acc,
@@ -2729,6 +2749,198 @@ pg_index_logical_checksum(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pg_index_logical_scan_init - prepare an executor-like scan of an index
+ *
+ * The index definition is evaluated on heap tuples.  The caller owns the
+ * returned state and must call pg_index_logical_scan_end().
+ */
+static bool
+pg_index_logical_scan_init(Oid indexoid, Snapshot snapshot,
+                           IndexLogicalScanState *scanstate)
+{
+    Oid         heapoid;
+    MemoryContext oldcontext;
+
+    MemSet(scanstate, 0, sizeof(*scanstate));
+    scanstate->snapshot = snapshot;
+
+    scanstate->idxRel = index_open(indexoid, AccessShareLock);
+
+    if (scanstate->idxRel->rd_rel->relkind != RELKIND_INDEX ||
+        !scanstate->idxRel->rd_index->indisvalid ||
+        !scanstate->idxRel->rd_index->indisready ||
+        !scanstate->idxRel->rd_index->indislive)
+    {
+        index_close(scanstate->idxRel, AccessShareLock);
+        MemSet(scanstate, 0, sizeof(*scanstate));
+        return false;
+    }
+
+    heapoid = IndexGetRelation(indexoid, false);
+    scanstate->heapRel = relation_open(heapoid, AccessShareLock);
+
+    if (scanstate->heapRel->rd_rel->relkind != RELKIND_RELATION &&
+        scanstate->heapRel->rd_rel->relkind != RELKIND_MATVIEW &&
+        scanstate->heapRel->rd_rel->relkind != RELKIND_TOASTVALUE)
+    {
+        relation_close(scanstate->heapRel, AccessShareLock);
+        index_close(scanstate->idxRel, AccessShareLock);
+        MemSet(scanstate, 0, sizeof(*scanstate));
+        return false;
+    }
+
+    scanstate->context = AllocSetContextCreate(CurrentMemoryContext,
+                                               "pg_checksums index logical",
+                                               ALLOCSET_SMALL_SIZES);
+    oldcontext = MemoryContextSwitchTo(scanstate->context);
+
+    scanstate->indexInfo = BuildIndexInfo(scanstate->idxRel);
+    scanstate->estate = CreateExecutorState();
+    scanstate->econtext = GetPerTupleExprContext(scanstate->estate);
+    scanstate->predicate = ExecPrepareQual(scanstate->indexInfo->ii_Predicate,
+                                           scanstate->estate);
+    scanstate->slot = MakeSingleTupleTableSlot(RelationGetDescr(scanstate->heapRel),
+                                               &TTSOpsHeapTuple);
+    scanstate->nattrs = scanstate->indexInfo->ii_NumIndexAttrs;
+    scanstate->values = palloc(sizeof(Datum) * scanstate->nattrs);
+    scanstate->nulls = palloc(sizeof(bool) * scanstate->nattrs);
+
+    MemoryContextSwitchTo(oldcontext);
+
+    return true;
+}
+
+/*
+ * pg_index_logical_scan_blocks - hash index definitions over a heap block range
+ */
+static void
+pg_index_logical_scan_blocks(IndexLogicalScanState *scanstate,
+                             BlockNumber start, BlockNumber end,
+                             ChecksumLogicalAccum *acc)
+{
+    BlockNumber blkno;
+    TupleDesc   idxdesc = RelationGetDescr(scanstate->idxRel);
+    BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
+
+    for (blkno = start; blkno < end; blkno++)
+    {
+        Buffer      buffer;
+        Page        page;
+        OffsetNumber maxoff;
+        OffsetNumber offnum;
+
+        buffer = ReadBufferExtended(scanstate->heapRel, MAIN_FORKNUM, blkno,
+                                    RBM_NORMAL, bstrategy);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+
+        if (PageIsNew(page))
+        {
+            UnlockReleaseBuffer(buffer);
+            if ((blkno & 63) == 0)
+                CHECK_FOR_INTERRUPTS();
+            continue;
+        }
+
+        pg_checksums_check_page(scanstate->heapRel, blkno, page);
+
+        maxoff = PageGetMaxOffsetNumber(page);
+        for (offnum = FirstOffsetNumber; offnum <= maxoff;
+             offnum = OffsetNumberNext(offnum))
+        {
+            ItemId      lp = PageGetItemId(page, offnum);
+            HeapTupleHeader htup;
+            HeapTupleData tuple;
+            Size        tuple_len;
+
+            if (!ItemIdIsNormal(lp))
+                continue;
+
+            if (!pg_checksums_item_is_sane(page, lp))
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_CORRUPTED),
+                         errmsg("corrupt line pointer in relation \"%s\" at block %u, offset %u",
+                                RelationGetRelationName(scanstate->heapRel),
+                                blkno, offnum)));
+
+            htup = (HeapTupleHeader) PageGetItem(page, lp);
+            tuple_len = ItemIdGetLength(lp);
+
+            pg_checksums_check_heap_tuple(scanstate->heapRel, blkno, offnum,
+                                          htup, tuple_len);
+
+            tuple.t_len = tuple_len;
+            tuple.t_data = htup;
+            tuple.t_tableOid = RelationGetRelid(scanstate->heapRel);
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+
+            if (!HeapTupleSatisfiesVisibility(&tuple, scanstate->snapshot,
+                                              buffer))
+                continue;
+
+            ResetExprContext(scanstate->econtext);
+            ExecStoreHeapTuple(&tuple, scanstate->slot, false);
+            scanstate->econtext->ecxt_scantuple = scanstate->slot;
+
+            if (scanstate->predicate != NULL &&
+                !ExecQual(scanstate->predicate, scanstate->econtext))
+                continue;
+
+            FormIndexDatum(scanstate->indexInfo, scanstate->slot,
+                           scanstate->estate, scanstate->values,
+                           scanstate->nulls);
+
+            {
+                uint32      row_hash = FNV_BASIS_32;
+                int         i;
+
+                for (i = 0; i < scanstate->nattrs; i++)
+                {
+                    Form_pg_attribute att = TupleDescAttr(idxdesc, i);
+                    uint32      col_hash;
+
+                    col_hash = pg_cell_checksum_canonical(scanstate->values[i],
+                                                          scanstate->nulls[i],
+                                                          att->atttypid,
+                                                          att->atttypmod,
+                                                          i + 1);
+                    row_hash = combine_checksums(row_hash, col_hash);
+                }
+
+                logical_accum_add(acc, row_hash);
+            }
+        }
+
+        UnlockReleaseBuffer(buffer);
+
+        if ((blkno & 63) == 0)
+            CHECK_FOR_INTERRUPTS();
+    }
+
+    FreeAccessStrategy(bstrategy);
+}
+
+/*
+ * pg_index_logical_scan_end - release an index logical scan state
+ */
+static void
+pg_index_logical_scan_end(IndexLogicalScanState *scanstate)
+{
+    if (scanstate->slot != NULL)
+        ExecDropSingleTupleTableSlot(scanstate->slot);
+    if (scanstate->estate != NULL)
+        FreeExecutorState(scanstate->estate);
+    if (scanstate->heapRel != NULL)
+        relation_close(scanstate->heapRel, AccessShareLock);
+    if (scanstate->idxRel != NULL)
+        index_close(scanstate->idxRel, AccessShareLock);
+    if (scanstate->context != NULL)
+        MemoryContextDelete(scanstate->context);
+
+    MemSet(scanstate, 0, sizeof(*scanstate));
+}
+
+/*
  * pg_index_logical_checksum_accum - heap-derived logical index content
  *
  * A logical index checksum describes the index entries that the table data
@@ -2747,22 +2959,10 @@ pg_index_logical_checksum_accum(Oid indexoid, bool check_privileges,
                                 ChecksumLogicalAccum *acc, bool *is_null)
 {
     Relation    idxRel;
-    Relation    heapRel;
-    Oid         heapoid;
-    IndexInfo  *indexInfo;
-    EState     *estate;
-    ExprContext *econtext;
-    ExprState  *predicate;
-    TupleTableSlot *slot;
-    TableScanDesc scan;
     Snapshot    snapshot;
-    Datum      *values;
-    bool       *nulls;
-    int         nattrs;
-    int         i;
-    bool        any_null = false;
-    MemoryContext index_context;
-    MemoryContext oldcontext;
+    IndexLogicalScanState scanstate;
+    BlockNumber nblocks;
+    int         workers;
 
     *is_null = false;
 
@@ -2775,6 +2975,7 @@ pg_index_logical_checksum_accum(Oid indexoid, bool check_privileges,
     {
         List       *parts = pg_checksums_leaf_indexes(indexoid);
         ListCell   *lc;
+        bool        any_null = false;
 
         foreach(lc, parts)
         {
@@ -2798,84 +2999,33 @@ pg_index_logical_checksum_accum(Oid indexoid, bool check_privileges,
         return;
     }
 
-    if (!idxRel->rd_index->indisvalid ||
-        !idxRel->rd_index->indisready ||
-        !idxRel->rd_index->indislive)
-    {
-        index_close(idxRel, AccessShareLock);
-        *is_null = true;
-        return;
-    }
-
-    heapoid = IndexGetRelation(indexoid, false);
-    heapRel = relation_open(heapoid, AccessShareLock);
-
-    if (heapRel->rd_rel->relkind != RELKIND_RELATION &&
-        heapRel->rd_rel->relkind != RELKIND_MATVIEW &&
-        heapRel->rd_rel->relkind != RELKIND_TOASTVALUE)
-    {
-        relation_close(heapRel, AccessShareLock);
-        index_close(idxRel, AccessShareLock);
-        *is_null = true;
-        return;
-    }
+    index_close(idxRel, AccessShareLock);
 
     snapshot = pg_checksums_get_snapshot();
 
-    index_context = AllocSetContextCreate(CurrentMemoryContext,
-                                          "pg_checksums index logical",
-                                          ALLOCSET_SMALL_SIZES);
-    oldcontext = MemoryContextSwitchTo(index_context);
-
-    indexInfo = BuildIndexInfo(idxRel);
-    estate = CreateExecutorState();
-    econtext = GetPerTupleExprContext(estate);
-    predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
-    slot = table_slot_create(heapRel, NULL);
-
-    nattrs = indexInfo->ii_NumIndexAttrs;
-    values = palloc(sizeof(Datum) * nattrs);
-    nulls = palloc(sizeof(bool) * nattrs);
-
-    scan = table_beginscan(heapRel, snapshot, 0, NULL);
-
-    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+    if (!pg_index_logical_scan_init(indexoid, snapshot, &scanstate))
     {
-        uint32      row_hash = FNV_BASIS_32;
-
-        ResetExprContext(econtext);
-        econtext->ecxt_scantuple = slot;
-
-        if (predicate != NULL && !ExecQual(predicate, econtext))
-            continue;
-
-        FormIndexDatum(indexInfo, slot, estate, values, nulls);
-
-        for (i = 0; i < nattrs; i++)
-        {
-            Form_pg_attribute att = TupleDescAttr(RelationGetDescr(idxRel), i);
-            uint32      col_hash;
-
-            col_hash = pg_cell_checksum_canonical(values[i], nulls[i],
-                                                  att->atttypid,
-                                                  att->atttypmod,
-                                                  i + 1);
-            row_hash = combine_checksums(row_hash, col_hash);
-        }
-
-        logical_accum_add(acc, row_hash);
+        *is_null = true;
+        return;
     }
 
-    table_endscan(scan);
-    ExecDropSingleTupleTableSlot(slot);
-    FreeExecutorState(estate);
-    pfree(values);
-    pfree(nulls);
-    relation_close(heapRel, AccessShareLock);
-    index_close(idxRel, AccessShareLock);
+    nblocks = RelationGetNumberOfBlocks(scanstate.heapRel);
+    workers = pg_checksums_worker_count();
+    if (nblocks < (BlockNumber) workers)
+        workers = (int) nblocks;
 
-    MemoryContextSwitchTo(oldcontext);
-    MemoryContextDelete(index_context);
+    if (workers < 1)
+    {
+        pg_index_logical_scan_blocks(&scanstate, 0, nblocks, acc);
+        pg_index_logical_scan_end(&scanstate);
+    }
+    else
+    {
+        pg_index_logical_scan_end(&scanstate);
+        pg_checksums_parallel_scan_blocks(CHECKSUM_TASK_INDEX_LOGICAL,
+                                          indexoid, false, nblocks, workers,
+                                          NULL, acc);
+    }
 }
 
 /*
@@ -3423,7 +3573,6 @@ pg_checksums_parallel_worker_main(dsm_segment *seg, shm_toc *toc)
 
     myresult->partial = 0;
     myresult->count = 0;
-    myresult->found_invalid = false;
     myresult->had_error = false;
 
     if (state->snapshot_size > 0)
@@ -3480,6 +3629,25 @@ pg_checksums_parallel_worker_main(dsm_segment *seg, shm_toc *toc)
                 myresult->count = acc.count;
                 break;
             }
+        case CHECKSUM_TASK_INDEX_LOGICAL:
+            {
+                IndexLogicalScanState scanstate;
+                ChecksumLogicalAccum acc = {0, 0};
+
+                if (!pg_index_logical_scan_init(state->reloid, snapshot,
+                                                &scanstate))
+                    elog(ERROR, "could not initialize logical index scan for index %u",
+                         state->reloid);
+
+                while (pg_checksums_consume(state, PG_CHECKSUMS_BLOCK_CHUNK,
+                                            &start, &end))
+                    pg_index_logical_scan_blocks(&scanstate, start, end, &acc);
+
+                pg_index_logical_scan_end(&scanstate);
+                myresult->partial = acc.sum;
+                myresult->count = acc.count;
+                break;
+            }
         case CHECKSUM_TASK_DATABASE_PHYSICAL:
         case CHECKSUM_TASK_DATABASE_LOGICAL:
             {
@@ -3531,8 +3699,8 @@ pg_checksums_parallel_worker_main(dsm_segment *seg, shm_toc *toc)
  *
  * Sets up the shared memory segment, launches the requested workers, lets the
  * leader participate in the scan, and folds the workers' results into the
- * caller's accumulator.  Physical/index scans use acc; table logical scans
- * use logical_acc.
+ * caller's accumulator.  Physical scans use acc; table and index logical
+ * scans use logical_acc.
  */
 static void
 pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
@@ -3547,13 +3715,14 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
     ChecksumWorkerResult *results;
     Snapshot    snapshot = NULL;
     uint32      snapshot_size = 0;
-    bool        is_table = (task_type == CHECKSUM_TASK_TABLE_PHYSICAL ||
-                            task_type == CHECKSUM_TASK_TABLE_LOGICAL);
+    bool        needs_snapshot = (task_type == CHECKSUM_TASK_TABLE_PHYSICAL ||
+                                  task_type == CHECKSUM_TASK_TABLE_LOGICAL ||
+                                  task_type == CHECKSUM_TASK_INDEX_LOGICAL);
     uint32      start;
     uint32      end;
     int         i;
 
-    if (is_table)
+    if (needs_snapshot)
     {
         snapshot = pg_checksums_get_snapshot();
         if (snapshot == NULL)
@@ -3593,8 +3762,6 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
         state->task_type = task_type;
         state->reloid = reloid;
         state->include_header = include_header;
-        state->include_system = false;
-        state->include_toast = false;
         state->nitems = nblocks;
         state->snapshot_size = snapshot_size;
         pg_atomic_init_u32(&state->next_item, 0);
@@ -3655,6 +3822,23 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
                     index_close(idxRel, AccessShareLock);
                     break;
                 }
+            case CHECKSUM_TASK_INDEX_LOGICAL:
+                {
+                    IndexLogicalScanState scanstate;
+
+                    if (!pg_index_logical_scan_init(reloid, snapshot,
+                                                    &scanstate))
+                        elog(ERROR, "could not initialize logical index scan for index %u",
+                             reloid);
+
+                    while (pg_checksums_consume(state, PG_CHECKSUMS_BLOCK_CHUNK,
+                                                &start, &end))
+                        pg_index_logical_scan_blocks(&scanstate, start, end,
+                                                     logical_acc);
+
+                    pg_index_logical_scan_end(&scanstate);
+                    break;
+                }
             default:
                 break;
         }
@@ -3667,7 +3851,8 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
         {
             if (pcxt->worker[i].bgwhandle != NULL)
             {
-                if (task_type == CHECKSUM_TASK_TABLE_LOGICAL)
+                if (task_type == CHECKSUM_TASK_TABLE_LOGICAL ||
+                    task_type == CHECKSUM_TASK_INDEX_LOGICAL)
                 {
                     logical_acc->sum += results[i].partial;
                     logical_acc->count += results[i].count;
@@ -3695,8 +3880,7 @@ pg_checksums_parallel_scan_blocks(ChecksumTaskType task_type, Oid reloid,
  * pg_checksums_parallel_scan_database - run a database scan in parallel
  */
 static void
-pg_checksums_parallel_scan_database(bool physical, bool include_system,
-                                    bool include_toast,
+pg_checksums_parallel_scan_database(bool physical,
                                     ChecksumRelationItem *items, uint32 nitems,
                                     int workers, ChecksumAccum64 *acc,
                                     ChecksumLogicalAccum *logical_acc,
@@ -3751,8 +3935,6 @@ pg_checksums_parallel_scan_database(bool physical, bool include_system,
                                     : CHECKSUM_TASK_DATABASE_LOGICAL;
         state->reloid = InvalidOid;
         state->include_header = false;
-        state->include_system = include_system;
-        state->include_toast = include_toast;
         state->nitems = nitems;
         state->snapshot_size = snapshot_size;
         pg_atomic_init_u32(&state->next_item, 0);
@@ -3946,8 +4128,7 @@ compute_database_checksum_internal(bool physical, bool include_system,
         compute_database_items(items, 0, nitems, physical, &acc,
                                physical ? NULL : &lacc, &had_error);
     else
-        pg_checksums_parallel_scan_database(physical, include_system,
-                                            include_toast, items, nitems,
+        pg_checksums_parallel_scan_database(physical, items, nitems,
                                             workers, &acc,
                                             physical ? NULL : &lacc,
                                             &had_error);

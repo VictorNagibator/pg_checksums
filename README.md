@@ -28,9 +28,9 @@
 * **All Index Access Methods**: Logical index checksums are derived from table
   data and the index definition, so B-tree, Hash, GiST, GIN, SP-GiST, BRIN and
   custom AMs are supported
-* **Parallel Computation**: Table and database checksums can be computed with
-  PostgreSQL parallel workers for faster scans of large relations; logical
-  index checksums are currently serial
+* **Parallel Computation**: Table, index and database checksums can be
+  computed with PostgreSQL parallel workers for faster scans of large
+  relations
 * **Partitioned Support**: Table and index checksums transparently aggregate
   the checksums of all leaf partitions/indexes
 * **Strict Mode**: `pg_checksums.strict` makes database scans fail instead of
@@ -418,10 +418,6 @@ These limitations are documented rather than silently ignored.
   `include_system = true`), FSM/VM forks or relation free space.  Foreign
   table partitions are skipped by partitioned table checksums because they
   have no local storage in this database.
-* **Logical index checksums are serial.** `pg_index_logical_checksum` scans the
-  table and evaluates the index definition in the calling backend; it does not
-  use `pg_checksums.workers` yet.  Table and database logical checksums are
-  parallel.
 * **32-bit hashes.** All logical checksums are 32-bit.  This is adequate for
   accidental corruption detection but not for cryptographic tamper evidence;
   FNV-1a is not a cryptographic hash.
@@ -435,12 +431,12 @@ These limitations are documented rather than silently ignored.
 
 ## Parallel Computation
 
-Table and database checksums can be computed in parallel using PostgreSQL's
-parallel worker infrastructure. Each worker scans a subset of the relation's
-blocks (or a subset of the database's relations) using a shared,
+Table, index and database checksums can be computed in parallel using
+PostgreSQL's parallel worker infrastructure. Each worker scans a subset of the
+relation's blocks (or a subset of the database's relations) using a shared,
 self-balancing atomic counter, and the partial results are combined by the
-leader.  Logical index checksums are currently serial because they evaluate
-the index definition while scanning the table.
+leader.  Logical index checksums parallelize the heap scan and evaluate the
+index definition in each worker.
 
 ### Configuration
 
@@ -672,8 +668,7 @@ on Linux, macOS, and Windows.
 4. MVCC behavior and concurrency
 5. Stability of logical checksums across physical reorganizations (VACUUM, CLUSTER, REINDEX)
 6. Error conditions and edge cases
-7. Parallel vs serial checksum consistency at the table and database levels
-   (logical index checksums are currently serial)
+7. Parallel vs serial checksum consistency at table, index and database levels
 8. Partitioned tables and indexes (single- and multi-level, with and without
    primary keys)
 9. Safety and validation: logical index checksums work for every access
@@ -760,8 +755,8 @@ So bump the version in `pg_checksums.control`, `META.json` and `Changes`, add
 the new SQL script (and an upgrade script if needed), and only then tag:
 
 ```bash
-git tag -a v1.3.0 -m "pg_checksums 1.3.0"
-git push origin v1.3.0
+git tag -a v1.3.1 -m "pg_checksums 1.3.1"
+git push origin v1.3.1
 ```
 
 ---

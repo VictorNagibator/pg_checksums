@@ -2,7 +2,7 @@
    "name": "pg_checksums",
    "abstract": "Multi-level data integrity checksums for PostgreSQL",
    "description": "pg_checksums provides checksum functions for PostgreSQL at six granularity levels (page, cell, tuple, table, index and database), each in a physical and a logical variant (cell level is logical only). Physical checksums detect storage corruption and change after VACUUM FULL, CLUSTER or REINDEX. Logical checksums depend only on data content: they exclude relation OIDs, heap TIDs and type OIDs, canonicalize enum, numeric, array, composite and range values, and do not require a primary key. Logical index checksums are derived from table data and the index definition, so they work for every access method. The implementation uses the FNV-1a 32-bit hash, supports parallel scans through the pg_checksums.workers GUC, and transparently aggregates partitioned tables and partitioned indexes. pg_checksums.strict makes database scans fail instead of skipping relations without a usable checksum.",
-   "version": "1.3.0",
+   "version": "1.3.1",
    "maintainer": [
       "Viktor Donskoi <vityadonskoy2004@gmail.com>"
    ],
@@ -10,9 +10,9 @@
    "provides": {
       "pg_checksums": {
          "abstract": "Checksum functions at page, cell, tuple, table, index and database level",
-         "file": "pg_checksums--1.3.0.sql",
+         "file": "pg_checksums--1.3.1.sql",
          "docfile": "README.md",
-         "version": "1.3.0"
+         "version": "1.3.1"
       }
    },
    "prereqs": {

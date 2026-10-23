@@ -1,5 +1,14 @@
 Revision history for pg_checksums
 
+1.3.1   2026-10-24
+
+    - Parallelize pg_index_logical_checksum(): the heap scan and index
+      definition evaluation are split across pg_checksums.workers.  Serial and
+      parallel results are identical.  Partitioned indexes aggregate their
+      leaf indexes as before.
+    - Remove unused parallel-scan state fields and the obsolete logical-table
+      found_invalid flag.
+
 1.3.0   2026-10-23
 
     - BREAKING: replace the legacy logical checksum format.  Logical
